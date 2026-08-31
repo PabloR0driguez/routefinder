@@ -12,6 +12,16 @@ from tqdm.auto import tqdm
 
 from routefinder.data.utils import get_dataloader
 from routefinder.envs import MTVRPEnv
+
+#New imports added for compatibility
+import torchrl.data.tensor_specs as tensor_specs
+from torchrl.data import (Bounded, Composite, UnboundedContinuous, UnboundedDiscrete,)
+tensor_specs.CompositeSpec = Composite
+tensor_specs.BoundedTensorSpec = Bounded
+tensor_specs.UnboundedContinuousTensorSpec = UnboundedContinuous
+tensor_specs.UnboundedDiscreteTensorSpec = UnboundedDiscrete
+
+#End of new imports
 from routefinder.models import RouteFinderBase, RouteFinderMoE
 from routefinder.models.baselines.mtpomo import MTPOMO
 from routefinder.models.baselines.mvmoe import MVMoE
@@ -182,10 +192,15 @@ if __name__ == "__main__":
     else:
         BaseLitModule = RouteFinderBase
 
-    model = BaseLitModule.load_from_checkpoint(
-        opts.checkpoint, map_location="cpu", strict=False
-    )
+    #Section commented for compatibility of versions purposes
+    #model = BaseLitModule.load_from_checkpoint(
+    #    opts.checkpoint, map_location="cpu", strict=False
+    #)
 
+    model = BaseLitModule.load_from_checkpoint(
+        opts.checkpoint, map_location="cpu", strict=False, 
+        weights_only=False,
+    )
     env = MTVRPEnv()
     policy = model.policy.to(device).eval()  # Use mixed precision if supported
 
