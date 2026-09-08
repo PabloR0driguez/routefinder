@@ -252,3 +252,157 @@ def generate_dataset(
             # Save to disk as dict
             log.info("Saving {} data to {}".format(problem.upper(), fname))
             np.savez(fname, **dataset)
+
+
+
+def generate_mtvrp_data_multi_speed_constraints(
+    dataset_size,
+    num_loc=20,
+    min_loc=0.0,
+    max_loc=1.0,
+    capacity=None,
+    min_demand=1,
+    max_demand=9,
+    scale_demand=True,
+    max_time=4.6,
+    max_distance_limit=2.8,  # 2sqrt(2) ~= 2.8
+    speed=1.0,
+    num_depots=3,  # number of depots, only used for multi-depot problems
+    variant="CVRP",
+    fleet_size=10,
+):
+    """Generate MTVRP data using NumPy for a specific variant.
+    NOTE: for MD (multi-depot) variants, we generate in the same way
+    as single depot (considering the first one), but set the number of depots to the desired value.
+    """
+    # if first two letters are "md", strip and set multi-depot flag
+    if variant[:2].lower() == "md":
+        variant = variant[2:]
+        num_depots = num_depots
+    else:
+        num_depots = 1  # single depot
+    variant = variant.upper()
+    if variant not in VARIANT_FEATURES:
+        raise ValueError(f"Unknown variant: {variant}")
+
+    features = VARIANT_FEATURES[variant]
+
+
+    base_capacity = (get_vehicle_capacity(num_loc) if capacity is None else float(capacity))
+    #We keep base capacity as base over which we will modify for each vehicle
+    #In a real scenario different freight types vary drastically
+    #Therefore we use extreme values
+    max_cap, min_cap = base_capacity*1.5, base_capacity*0.5
+    #generate capacites with as many samples (dataset_size) and vehicles
+    capacity_non_normalized = np.random.uniform(min_cap, max_cap, size=(dataset_size, fleet_size),).astype(np.float32)
+    if scale_demand:
+        vehicle_capacity = capacity_non_normalized / base_capacity
+    else:
+        vehicle_capacity = capacity_non_normalized
+
+    # Generate locations
+    locs = np.random.uniform(min_loc, max_loc, (dataset_size, num_depots + num_loc, 2))
+
+    # Generate demands
+    def generate_demand(size):
+        demand = np.random.randint(min_demand, max_demand + 1, size=size,).astype(np.float32)
+        if scale_demand:
+            return demand / base_capacity
+        return demand
+
+    demand_linehaul = generate_demand((dataset_size, num_loc))
+    demand_backhaul = None
+
+    if features["B"]:
+        demand_backhaul = np.zeros((dataset_size, num_loc))
+        backhaul_mask = (
+            np.random.rand(dataset_size, num_loc) < 0.2
+        )  # 20% of nodes are backhaul
+        demand_backhaul[backhaul_mask] = generate_demand(backhaul_mask.sum())
+        demand_linehaul[backhaul_mask] = 0
+
+    # Generate backhaul class
+    backhaul_class = (
+        np.full((dataset_size, 1), 2 if features["M"] else 1) if features["B"] else None
+    )
+
+    # Generate open route
+    open_route = np.full((dataset_size, 1), features["O"]) if features["O"] else None
+
+    # Generate time windows and service time
+    time_windows = None
+    service_time = None
+    if features["TW"]:
+        a, b, c = 0.15, 0.18, 0.2
+        service_time = a + (b - a) * np.random.rand(dataset_size, num_loc)
+        tw_length = b + (c - b) * np.random.rand(dataset_size, num_loc)
+        # note: we assume that the first depot only for this
+        d_0i = np.linalg.norm(locs[:, 0:1] - locs[:, num_depots:], axis=2)
+        h_max = (max_time - service_time - tw_length) / d_0i * speed - 1
+        tw_start = (
+            (1 + (h_max - 1) * np.random.rand(dataset_size, num_loc)) * d_0i / speed
+        )
+        tw_end = tw_start + tw_length
+
+        time_windows = np.concatenate(
+            [
+                np.zeros((dataset_size, num_depots, 2)),
+                np.stack([tw_start, tw_end], axis=-1),
+            ],
+            axis=1,
+        )
+        time_windows[:, :num_depots, 1] = max_time
+        # pad service time until the number of depots
+        service_time = np.pad(service_time, ((0, 0), (num_depots, 0)))
+
+    # Generate distance limits: dist_lower_bound = 2 * max(depot_to_location_distance),
+    # max = min(dist_lower_bound, max_distance_limit). Ensures feasible yet challenging
+    # constraints, with each instance having a unique, meaningful limit.
+    if features["L"]:
+        # Calculate the maximum distance from depot to any location
+        max_dist = np.max(np.linalg.norm(locs[:, 1:] - locs[:, 0:1], axis=2), axis=1)
+
+        # Calculate the minimum distance limit (2 * max_distance)
+        distance_lower_bound = 2 * max_dist + 1e-6  # Add epsilon to avoid zero distance
+
+        # Ensure max_distance_limit is not exceeded
+        max_distance_limit = np.maximum(max_distance_limit, distance_lower_bound + 1e-6)
+
+        # Generate distance limits between min_distance_limits and max_distance_limit
+        distance_limit = np.random.uniform(
+            distance_lower_bound,
+            np.full_like(distance_lower_bound, max_distance_limit),
+            (dataset_size,),
+        )[:, None]
+    else:
+        distance_limit = None
+
+    # Generate speed
+    #Currently speed is 1, with the new vehicle dependent speed we add a min and max
+    #speed = np.full((dataset_size, 1), speed)
+    min_speed, max_speed = 0.5, 1.5 #Strong values in order to assess impact with heavy speed differences
+    vehicle_speed =np.random.uniform(min_speed, max_speed, size=(dataset_size, fleet_size),).astype(np.float32)
+ 
+
+    data = {
+        "locs": locs.astype(np.float32),
+        "demand_linehaul": demand_linehaul.astype(np.float32),
+        "vehicle_capacity": vehicle_capacity.astype(np.float32),
+        "speed": vehicle_speed,
+        "num_depots": np.full((dataset_size, 1), num_depots).astype(np.int32),
+    }
+
+    # Only include features that are used in the variant
+    if features["B"]:
+        data["demand_backhaul"] = demand_backhaul.astype(np.float32)
+        data["backhaul_class"] = backhaul_class.astype(np.float32)
+    if features["O"]:
+        data["open_route"] = open_route
+    if features["TW"]:
+        data["time_windows"] = time_windows.astype(np.float32)
+        data["service_time"] = service_time.astype(np.float32)
+    if features["L"]:
+        data["distance_limit"] = distance_limit.astype(np.float32)
+
+    return data
+
