@@ -406,3 +406,65 @@ def generate_mtvrp_data_multi_speed_constraints(
 
     return data
 
+
+def generate_dataset_multi_speed_constraints(
+    filename=None,
+    data_dir="data",
+    name=None,
+    problem="cvrp",
+    dataset_size=1000,
+    graph_sizes=[100],
+    overwrite=True,
+    seed=1234,
+    disable_warning=False,
+    **kwargs,
+):
+    """We keep a similar structure as in Kool et al. 2019 but save and load the data as npz
+    This is way faster and more memory efficient than pickle and also allows for easy transfer to TensorDict
+    """
+
+    fname = filename
+    if isinstance(graph_sizes, int):
+        graph_sizes = [graph_sizes]
+    for graph_size in graph_sizes:
+        datadir = os.path.join(data_dir, problem)
+        os.makedirs(datadir, exist_ok=True)
+
+        if filename is None:
+            fname = os.path.join(
+                datadir,
+                "{}{}_seed{}.npz".format(
+                    graph_size,
+                    "_{}".format(name) if name is not None else "",
+                    seed,
+                ),
+            )
+        else:
+            fname = check_extension(filename, extension=".npz")
+
+        # Generate any needed directories
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
+
+        if not overwrite and os.path.isfile(check_extension(fname, extension=".npz")):
+            if not disable_warning:
+                log.info(
+                    "File {} already exists! Run with -f option to overwrite. Skipping...".format(
+                        fname
+                    )
+                )
+            continue
+
+        # Set seed
+        np.random.seed(seed)
+
+        # Automatically generate dataset
+        dataset = generate_mtvrp_data_multi_speed_constraints(
+            dataset_size=dataset_size, num_loc=graph_size, variant=problem, **kwargs
+        )
+
+        # A function can return None in case of an error or a skip
+        if dataset is not None:
+            # Save to disk as dict
+            log.info("Saving {} data to {}".format(problem.upper(), fname))
+            np.savez(fname, **dataset)
+
