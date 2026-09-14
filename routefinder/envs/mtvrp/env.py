@@ -448,6 +448,15 @@ class MTVRPEnv(RL4COEnvBase):
         ), "there are unfeasible time windows" #start and end times
 
         # --> Incorporate the effect of different speeds on time windows
+        # THIS ASSERT IS GIVING TROUBLE
+        deadline = gather_by_index(td["time_windows"], next_node)[..., 1]
+        valid_time = curr_time <= deadline
+        if not valid_time.all().item():
+            print("time:", curr_time)
+            print("deadline:", deadline)
+            print("Next node:", next_node)
+            print("NaN times?:", torch.isnan(curr_time))
+            print("Vehicle speeds:", td.get("vehicle_speeds", None))
         assert torch.all(
             td["time_windows"][..., :, 0] + d_j0 + td["service_time"]
             <= td["time_windows"][..., 0, 1, None]
