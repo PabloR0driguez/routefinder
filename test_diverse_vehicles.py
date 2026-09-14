@@ -6,6 +6,9 @@ import warnings
 
 import torch
 
+import matplotlib.pyplot as plt
+
+
 from rl4co.data.transforms import StateAugmentation
 from rl4co.utils.ops import gather_by_index, unbatchify
 from tqdm.auto import tqdm
@@ -259,16 +262,15 @@ if __name__ == "__main__":
             os.makedirs(savedir, exist_ok=True)
             pickle.dump(results, open(savedir + checkpoint_name + ".pkl", "wb"))
 
-    import matplotlib.pyplot as plt
 
-    sample_idx = 0
+        sample_idx = 0
 
-
-    ax = env.render(
-        td_test[sample_idx].cpu(),
-        actions=o["best_aug_actions"][0].cpu(),
-        return_ax=True,
-    )
-
-    ax.figure.savefig("multivehicle_route.png", bbox_inches="tight")
-    plt.close(ax.figure)
+        ax = env.render(
+            td_test[sample_idx].cpu(),
+            actions=o["best_aug_actions"][0].cpu(),
+            return_ax=True,
+        )
+        ax.figure.savefig(
+            f"multivehicle_route_{problem}.png",
+            bbox_inches="tight",
+        )
