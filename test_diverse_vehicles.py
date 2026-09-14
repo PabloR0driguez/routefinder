@@ -227,7 +227,8 @@ if __name__ == "__main__":
         )
         env = MTVRPEnv(generator=generator, check_solution=False)
 
-
+        # random seed
+        torch.manual_seed(123)
         td_all = generator(batch_size=[opts.num_instances])
         dataloader = get_dataloader(td_all, batch_size=opts.batch_size)
         start = time.time()
