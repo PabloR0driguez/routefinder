@@ -14,30 +14,40 @@ def render(
     vehicle_capacity=None,
     fontsize: int = 10,
     return_ax: bool = False,
+    show_demands: bool = False,
+    show_arrows: bool = False,
 ):
     import matplotlib.pyplot as plt
     import numpy as np
 
-    from matplotlib import cm
+    from matplotlib import cm, colormaps
     from matplotlib.colors import ListedColormap
 
-    route_starts = (actions[:-1] == 0) & (actions[1:] != 0)
-    num_routes = route_starts.sum().item()
-    cmap = cm.get_cmap("turbo")
+    td = td.detach().cpu()
+
+    if td.batch_size != torch.Size([]):
+        td = td[0]
+        if actions is not None:
+            actions = actions[0]
+
+    if actions is None:
+        actions = td.get("action", None)
+    if actions is not None:
+        if actions.ndim == 2 and actions.shape[0] == 1:
+            actions = actions[0]
+        actions = actions.detach().cpu()
+
+    if actions is None:
+        num_routes = 1
+    else:
+        route_starts = (actions[:-1] == 0) & (actions[1:] != 0)
+        num_routes = max(route_starts.sum().item(), 1)
+    cmap = colormaps["turbo"]
     color_list = [cmap(x) for x in np.linspace(0.05, 0.95, num_routes)]
     out = ListedColormap(color_list)
 
     if ax is None:
         _, ax = plt.subplots(dpi=100, figsize=(6, 6))
-
-    td = td.detach().cpu()
-
-    if actions is None:
-        actions = td.get("action", None)
-
-    if td.batch_size != torch.Size([]):
-        td = td[0]
-        actions = actions[0]
 
     locs = td["locs"]
     scale_demand = td["capacity_original"]
@@ -71,11 +81,23 @@ def render(
         locs[0, 0],
         locs[0, 1],
         edgecolors=cm.Set2(2),
-        facecolors="none",
-        s=100,
+        facecolors=cm.Set2(2),
+        s=150,
         linewidths=2,
         marker="s",
         alpha=1,
+        zorder=4,
+    )
+    ax.text(
+        locs[0, 0],
+        locs[0, 1],
+        "D",
+        ha="center",
+        va="center",
+        fontsize=fontsize,
+        fontweight="bold",
+        color="white",
+        zorder=5,
     )
 
     for node_idx, loc in enumerate(locs):
@@ -83,15 +105,16 @@ def render(
             continue
         delivery, pickup = demands_linehaul[node_idx], demands_backhaul[node_idx]
         if delivery > 0:
-            ax.text(
-                loc[0],
-                loc[1] + 0.02,
-                f"{delivery.item()}",
-                horizontalalignment="center",
-                verticalalignment="bottom",
-                fontsize=fontsize,
-                color=cm.Set2(0),
-            )
+            if show_demands:
+                ax.text(
+                    loc[0],
+                    loc[1] + 0.02,
+                    f"{delivery.item()}",
+                    horizontalalignment="center",
+                    verticalalignment="bottom",
+                    fontsize=fontsize,
+                    color=cm.Set2(0),
+                )
             # scatter delivery as downward triangle
             ax.scatter(
                 loc[0],
@@ -104,15 +127,16 @@ def render(
                 alpha=1,
             )
         elif pickup > 0:
-            ax.text(
-                loc[0],
-                loc[1] - 0.02,
-                f"{pickup.item()}",
-                horizontalalignment="center",
-                verticalalignment="top",
-                fontsize=fontsize,
-                color=cm.Set2(1),
-            )
+            if show_demands:
+                ax.text(
+                    loc[0],
+                    loc[1] - 0.02,
+                    f"{pickup.item()}",
+                    horizontalalignment="center",
+                    verticalalignment="top",
+                    fontsize=fontsize,
+                    color=cm.Set2(1),
+                )
             ax.scatter(
                 loc[0],
                 loc[1],
@@ -137,10 +161,11 @@ def render(
         from_loc = locs[ai]
         to_loc = locs[aj]
         # if any of from_loc or to_loc is depot, change color and linewidth
+        route_color = color_list[color_idx % num_routes]
         if ai == 0 or aj == 0:
-            color, lw, alpha, style = "lightgrey", 1, 0.5, "--"
+            color, lw, alpha, style = route_color, 1.5, 0.9, "--"
         else:
-            color, lw, alpha, style = out(color_idx), 1, 1, ""
+            color, lw, alpha, style = route_color, 1.5, 0.85, "-"
         ax.plot(
             [from_loc[0], to_loc[0]],
             [from_loc[1], to_loc[1]],
@@ -149,14 +174,15 @@ def render(
             alpha=alpha,
             linestyle=style,
         )
-        ax.annotate(
-            "",
-            xy=(to_loc[0], to_loc[1]),
-            xytext=(from_loc[0], from_loc[1]),
-            arrowprops=dict(arrowstyle="->", color=color, lw=lw, alpha=alpha),
-            size=15,
-            annotation_clip=False,
-        )
+        if show_arrows:
+            ax.annotate(
+                "",
+                xy=(to_loc[0], to_loc[1]),
+                xytext=(from_loc[0], from_loc[1]),
+                arrowprops=dict(arrowstyle="->", color=color, lw=lw, alpha=alpha),
+                size=15,
+                annotation_clip=False,
+            )
 
     if scale_xy:
         ax.set_xlim(-0.05, 1.05)
@@ -165,6 +191,7 @@ def render(
     # Remove the ticks
     ax.set_xticks([])
     ax.set_yticks([])
+    ax.set_title("Multi-vehicle route", pad=12)
 
     if return_ax:
         return ax

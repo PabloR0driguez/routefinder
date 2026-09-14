@@ -101,6 +101,13 @@ class MTVRPGenerator(Generator):
         variant_preset=None,
         use_combinations=True,
         subsample=True,
+        #---> We add new parameters
+        fleet_size: int=1, 
+        min_speed: float = None,
+        max_speed: float = None,
+        min_capacity_factor: float = 1.0,
+        max_capacity_factor: float = 1.0,
+        #<---
         **kwargs,
     ) -> None:
         # Location distribution
@@ -158,17 +165,29 @@ class MTVRPGenerator(Generator):
             use_combinations = False
         self.use_combinations = use_combinations
         self.subsample = subsample
+        #---> We add new parameters
+        self.speed = speed
+        self.min_speed = min_speed
+        self.max_speed = max_speed
+        self.min_capacity_factor = min_capacity_factor
+        self.max_capacity_factor = max_capacity_factor
+        self.fleet_size = fleet_size   
+        #<---
 
     def _generate(self, batch_size) -> TensorDict:
         # Locations
         locs = self.generate_locations(batch_size=batch_size, num_loc=self.num_loc)
-
+        #--->
+        #This section must change because now we use capacities not capacity
         # Vehicle capacity (C, B) - applies to both linehaul and backhaul
-        vehicle_capacity = torch.full(
-            (*batch_size, 1), self.capacity, dtype=torch.float32
-        )
-        capacity_original = vehicle_capacity.clone()
+        #vehicle_capacity = torch.full((*batch_size, 1), self.capacity, dtype=torch.float32)
+        vehicle_capacities = self.generate_vehicle_capacities(batch_size)
+        #capacity_original = vehicle_capacity.clone()
+        capacity_original = vehicle_capacities[:, 0:1].clone()
 
+        vehicle_speeds = self.generate_vehicle_speeds(batch_size)
+
+        #<---
         # linehaul demand / delivery (C) and backhaul / pickup demand (B)
         demand_linehaul, demand_backhaul = self.generate_demands(
             batch_size=batch_size, num_loc=self.num_loc
@@ -182,7 +201,7 @@ class MTVRPGenerator(Generator):
         open_route = self.generate_open_route(shape=(*batch_size, 1))
 
         # Time windows (TW)
-        speed = self.generate_speed(shape=(*batch_size, 1))
+        speed = self.generate_speed(shape=(*batch_size, 1)) #still use for reference
         time_windows, service_time = self.generate_time_windows(
             locs=locs,
             speed=speed,
@@ -193,9 +212,9 @@ class MTVRPGenerator(Generator):
 
         # scaling
         if self.scale_demand:
-            demand_backhaul /= vehicle_capacity
-            demand_linehaul /= vehicle_capacity
-            vehicle_capacity /= vehicle_capacity
+            demand_backhaul /= self.capacity
+            demand_linehaul /= self.capacity
+            vehicle_capacities = vehicle_capacities / self.capacity
 
         # Put all variables together
         td = TensorDict(
@@ -207,10 +226,13 @@ class MTVRPGenerator(Generator):
                 "distance_limit": distance_limit,  # (L)
                 "time_windows": time_windows,  # (TW)
                 "service_time": service_time,  # (TW)
-                "vehicle_capacity": vehicle_capacity,  # (C)
+                # ---> Modification for different capacities
+                "vehicle_capacity": vehicle_capacities[:, 0:1],  # (C)
+                "vehicle_capacities": vehicle_capacities,
                 "capacity_original": capacity_original,  # unscaled capacity (C)
                 "open_route": open_route,  # (O)
                 "speed": speed,  # common
+                "vehicle_speeds": vehicle_speeds, 
             },
             batch_size=batch_size,
         )
@@ -430,6 +452,29 @@ class MTVRPGenerator(Generator):
             return torch.randint(1, 3, shape, dtype=torch.float32)
         else:
             return torch.full(shape, self.backhaul_class, dtype=torch.float32)
+
+    #---> We add new generators because now there are more attribtues to generate
+    def generate_vehicle_speeds(self, batch_size):
+        speed, fleet_size = getattr(self, "speed", 1.0), getattr(self, "fleet_size", 1)
+        min_speed, max_speed = getattr(self, "min_speed", None), getattr(self, "max_speed", None)
+        """Generate speeds for the each vehicle"""
+        if min_speed is None or max_speed is None:
+            # identical to the single-speed behavior.
+            return torch.full((*batch_size, fleet_size), speed, dtype=torch.float32)
+        return torch.FloatTensor(*batch_size, fleet_size).uniform_(min_speed, max_speed)
+    def generate_vehicle_capacities(self, batch_size) -> torch.Tensor:
+        """Generate capacities for the each vehicle"""
+        fleet_size = getattr(self, "fleet_size", 1)
+        speed = getattr(self, "speed", 1.0)
+        capacity = self.capacity
+        min_capacity_factor = getattr(self, "min_capacity_factor", 1.0)
+        max_capacity_factor = getattr(self, "max_capacity_factor", 1.0)
+        if min_capacity_factor == max_capacity_factor == 1.0:
+            # No setup configured
+            return torch.full((*batch_size, fleet_size), capacity, dtype=torch.float32)
+        min_cap = capacity * min_capacity_factor
+        max_cap = capacity * max_capacity_factor
+        return torch.FloatTensor(*batch_size, fleet_size).uniform_(min_cap, max_cap)
 
     @staticmethod
     def save_data(td: TensorDict, path, compress: bool = False):

@@ -175,6 +175,20 @@ class MTVRPEnv(RL4COEnvBase):
             done
         ).float()  # we use the `get_reward` method to compute the reward
 
+        # -->  Vehicle Change    <---
+        vehicle_change_bool = ( (curr_node == 0)&(prev_node != 0)  )
+        needs_next_vehicle = (vehicle_change_bool & ~done)
+        new_vehicle_index = td["current_vehicle"] + needs_next_vehicle.to(torch.long)
+
+        # We apply a budget of vehicles
+        number_of_vehicles = td["vehicle_speeds"].shape[1]
+        available_vehicles_bool = new_vehicle_index < number_of_vehicles
+        #keep current if none more available
+        current_vehicle = torch.where(available_vehicles_bool, new_vehicle_index, td["current_vehicle"],)
+        current_speed = torch.gather(td["vehicle_speeds"], dim=1, index=current_vehicle[:, None],)
+        ##
+        #---> Capacity tracker
+        current_capacity = torch.gather(td["vehicle_capacities"], dim=1, index=current_vehicle[:, None])
         td.update(
             {
                 "current_node": curr_node,
@@ -185,6 +199,10 @@ class MTVRPEnv(RL4COEnvBase):
                 "used_capacity_linehaul": used_capacity_linehaul,
                 "used_capacity_backhaul": used_capacity_backhaul,
                 "visited": visited,
+                # New entries
+                "current_vehicle": current_vehicle,
+                "speed": current_speed,
+                "vehicle_capacity": current_capacity,
             }
         )
         td.set("action_mask", self.get_action_mask(td))
@@ -232,6 +250,23 @@ class MTVRPEnv(RL4COEnvBase):
             "distance_limit", torch.full_like(demand_linehaul[..., :1], float("inf"))
         )
 
+        # ---> Add fleetwise speeds <--- IMPORTANT MARKER
+        vehicle_speeds = td.get("vehicle_speeds", None)
+        if vehicle_speeds is None:
+            vehicle_speeds = td.get("speed", torch.ones_like(demand_linehaul[..., :1]),) #1s if not
+
+        current_vehicle = torch.zeros(vehicle_speeds.shape[:-1], dtype=torch.long, device=device,)
+        active_speed = vehicle_speeds[:, 0:1] #all instances, only column 0, only current vehicle
+        # ---> Mirror logic for capacities
+
+        vehicle_capacities = td.get("vehicle_capacities", None)
+        if vehicle_capacities is None:
+            vehicle_capacities = td.get(
+                "vehicle_capacity", torch.ones_like(demand_linehaul[..., :1])
+            )
+        active_capacity = vehicle_capacities[:, 0:1]
+
+
         # Create reset TensorDict
         td_reset = TensorDict(
             {
@@ -243,10 +278,10 @@ class MTVRPEnv(RL4COEnvBase):
                 "service_time": service_time,
                 "open_route": open_route,
                 "time_windows": time_windows,
-                "speed": td.get("speed", torch.ones_like(demand_linehaul[..., :1])),
-                "vehicle_capacity": td.get(
-                    "vehicle_capacity", torch.ones_like(demand_linehaul[..., :1])
-                ),
+                # --> IMPORTANT, we are replacing the old capacity
+                #"vehicle_capacity": td.get(
+                #    "vehicle_capacity", torch.ones_like(demand_linehaul[..., :1])
+                #),
                 "capacity_original": td.get(
                     "capacity_original", torch.ones_like(demand_linehaul[..., :1])
                 ),
@@ -270,6 +305,13 @@ class MTVRPEnv(RL4COEnvBase):
                     dtype=torch.bool,
                     device=device,
                 ),
+                #new entries
+                "vehicle_speeds": vehicle_speeds,
+                "current_vehicle": current_vehicle,
+                "speed": active_speed,
+                "vehicle_capacities": vehicle_capacities,
+                "vehicle_capacity": active_capacity,
+                
             },
             batch_size=batch_size,
             device=device,
@@ -291,7 +333,7 @@ class MTVRPEnv(RL4COEnvBase):
             td["time_windows"][..., 0],
             td["time_windows"][..., 1],
         )
-        arrival_time = td["current_time"] + (d_ij / td["speed"])
+        arrival_time = td["current_time"] + (d_ij / td["speed"]) #speed dependent
         # can reach in time -> only need to *start* in time
         can_reach_customer = arrival_time < late_tw
         # we must ensure that we can return to depot in time *if* route is closed
@@ -382,6 +424,10 @@ class MTVRPEnv(RL4COEnvBase):
         n_loc -= 1  # exclude depot
         sorted_pi = actions.data.sort(1)[0]
 
+        # ---> Important note: Loading vehicle speeds
+        vehicle_speeds = td.get("vehicle_speeds", td["speed"],)
+        vehicle_counter = vehicle_speeds.shape[1]
+        # <---
         # all customer nodes visited exactly once
         assert (
             torch.arange(1, n_loc + 1, out=sorted_pi.data.new())
@@ -399,15 +445,46 @@ class MTVRPEnv(RL4COEnvBase):
         assert torch.all(td["service_time"] >= 0.0), "Service time must be non-negative."
         assert torch.all(
             td["time_windows"][..., 0] < td["time_windows"][..., 1]
-        ), "there are unfeasible time windows"
+        ), "there are unfeasible time windows" #start and end times
+
+        # --> Incorporate the effect of different speeds on time windows
         assert torch.all(
             td["time_windows"][..., :, 0] + d_j0 + td["service_time"]
             <= td["time_windows"][..., 0, 1, None]
         ), "vehicle cannot perform service and get back to depot in time."
+
+        # WE ARE HERE 
+        #time_windows: start_time, end_time)
+        opening_times = td["time_windows"].select(dim=-1, index=0,)
+        closing_times = td["time_windows"].select(dim=-1, index=1,)
+        #Use unsqueeze to "propagate" across dimension D that we need everywhere
+        #ie, for all nodes vehicles have the same speed
+        vehicle_speeds = td.get("vehicle_speeds", td["speed"],) #(instances, vehicles)
+        num_vehicles = vehicle_speeds.shape[1]
+        speed_per_node = vehicle_speeds.unsqueeze(dim=1,) #add dim to represent node
+        depot_location = locs.narrow(dim=1, start=0, length=1,) # take depot location
+        depot_distances = get_distance(locs, depot_location,)  #  distances to depot, (instances, distance node-depot)
+        distance_per_vehicle = depot_distances.unsqueeze(dim=2,) #(instances, nodes, 1), 1 for speed
+        duration_per_vehicle= distance_per_vehicle / speed_per_node #(instances, nodes, vehicles)
+        opening_time_per_vehicle = opening_times.unsqueeze(dim=2)
+        closing_time_per_vehicle = closing_times.unsqueeze(dim=2)
+        earliest_service_start = torch.maximum(duration_per_vehicle,opening_time_per_vehicle,)
+        can_start_service = (earliest_service_start <= closing_time_per_vehicle)
+        service_time_per_vehicle = td["service_time"].unsqueeze(dim=2)
+
+        return_to_depot_time = (earliest_service_start+ service_time_per_vehicle+ duration_per_vehicle)
+        depot_closing_time = closing_times.select(dim=1, index=0)
+        depot_closing_time = depot_closing_time.unsqueeze(dim=1) #add nodes dim
+        depot_closing_time = depot_closing_time.unsqueeze(dim=2) #add vehicles dim
+        can_return_to_depot = (return_to_depot_time <= depot_closing_time)
+        can_serve_customer = (can_start_service & can_return_to_depot)
+        assert can_serve_customer.any(dim=2).all().item(), ("Nodes must be serviced by at least one vehicle")
         # check individual time windows
         curr_time = torch.zeros(batch_size, dtype=torch.float32, device=td.device)
         curr_node = torch.zeros(batch_size, dtype=torch.int64, device=td.device)
         curr_length = torch.zeros(batch_size, dtype=torch.float32, device=td.device)
+        curr_vehicle = torch.zeros(batch_size, dtype=torch.int64, device=td.device)
+        curr_speed = vehicle_speeds[:, 0]
         for ii in range(actions.size(1)):
             next_node = actions[:, ii]
             curr_loc = gather_by_index(td["locs"], curr_node)
@@ -422,17 +499,26 @@ class MTVRPEnv(RL4COEnvBase):
                 curr_length <= td["distance_limit"].squeeze(-1)
             ), "Route exceeds distance limit"
             curr_length[next_node == 0] = 0.0  # reset length for depot
-
-            curr_time = torch.max(
-                curr_time + dist, gather_by_index(td["time_windows"], next_node)[..., 0]
-            )
+            # ---> This section needs to be altered for multi speeds  <---
+            #curr_time = torch.max(curr_time + dist, gather_by_index(td["time_windows"], next_node)[..., 0])
+            curr_time = torch.max(curr_time + dist / curr_speed, gather_by_index(td["time_windows"], next_node)[..., 0],)
+            #### <---
             assert torch.all(
                 curr_time <= gather_by_index(td["time_windows"], next_node)[..., 1]
             ), "vehicle cannot start service before deadline"
             curr_time = curr_time + gather_by_index(td["service_time"], next_node)
             curr_node = next_node
             curr_time[curr_node == 0] = 0.0  # reset time for depot
+            # ---> At depot, change vehicle
+            needs_next_vehicle = (next_node == 0) & (curr_node != 0)
+            new_vehicle_index= curr_vehicle+ needs_next_vehicle.to(torch.long)
+            can_advance = new_vehicle_index < num_vehicles
+            #remember same logic, if not available lets keep current
+            curr_vehicle = torch.where(can_advance, new_vehicle_index, curr_vehicle)
+            curr_speed = torch.gather(vehicle_speeds, dim=1, index=curr_vehicle[:, None]).squeeze(-1)
 
+            curr_node = next_node
+            curr_time[curr_node == 0] = 0.0
         # Demand constraints (C) and (B) and (MB)
         # we keep track of the current picked up linehaul and backhaul
         # and the used capacity of both
@@ -440,7 +526,26 @@ class MTVRPEnv(RL4COEnvBase):
         demand_b = td["demand_backhaul"].gather(dim=1, index=actions)
         used_cap_l = torch.zeros_like(td["demand_linehaul"][:, 0])
         used_cap_b = torch.zeros_like(td["demand_backhaul"][:, 0])
+
+        #  ---> Fixing shape issues <---
+        vehicle_capacities = td.get("vehicle_capacities")
+        #look at all instances, take vehicle index 0
+        curr_capacity = vehicle_capacities[:, 0] 
+        curr_vehicle_cap = torch.zeros(batch_size, dtype=torch.int64, device=td.device)
+        backhaul_class = td["backhaul_class"].squeeze(-1)
+
         for ii in range(actions.size(1)):
+            #  ---> Adding vehicle change <---
+            #if we do to depot and we carry something, means we are channging
+            vehicle_change=(actions[:, ii]==0)&(used_cap_l+used_cap_b>0)
+            new_vehicle_index= curr_vehicle_cap+vehicle_change.to(torch.long)
+            vehicle_quantity = td["vehicle_speeds"].shape[1]
+            available_vehicles_bool = new_vehicle_index < vehicle_quantity
+            curr_vehicle_cap = torch.where(available_vehicles_bool, new_vehicle_index, curr_vehicle_cap)
+            curr_capacity = torch.gather(vehicle_capacities, dim=1, index=curr_vehicle_cap[:, None]).squeeze(-1)
+
+
+
             # reset at depot
             used_cap_l = used_cap_l * (actions[:, ii] != 0)
             used_cap_b = used_cap_b * (actions[:, ii] != 0)
@@ -450,32 +555,32 @@ class MTVRPEnv(RL4COEnvBase):
 
             # For backhaul_class 1 (B), we must ensure that if we are carrying backhaul, we are not picking up linehaul
             assert (
-                (td["backhaul_class"] == 2)
+                (backhaul_class == 2)
                 | (used_cap_b == 0)
-                | ((td["backhaul_class"] == 1) & ~(demand_l[:, ii] > 0))
+                | ((backhaul_class == 1) & ~(demand_l[:, ii] > 0))
             ).all(), "Cannot pick up linehaul while carrying backhaul due to precedence constraints"
 
             # For backhaul_class 2 (MB), we cannot pick up linehaul if the used capacity of backhaul is already at the vehicle capacity
             # also, cannot pick up other backhauls if we are full
             assert (
-                (td["backhaul_class"] == 1)
+                (backhaul_class == 1)
                 | (used_cap_b == 0)
                 | (
-                    (td["backhaul_class"] == 2)
-                    & (used_cap_b + demand_l[:, ii] <= td["vehicle_capacity"])
+                    (backhaul_class == 2)
+                    & (used_cap_b + demand_l[:, ii] <= curr_capacity)
                 )
             ).all(), "Cannot deliver linehaul, not enough load"
 
             # Assertions: total used linehaul and backhaul capacity should not exceed vehicle capacity
             assert (
-                used_cap_l <= td["vehicle_capacity"]
+                used_cap_l <= curr_capacity
             ).all(), "Used more linehaul than capacity: {} / {}".format(
                 used_cap_l, td["vehicle_capacity"]
             )
             assert (
-                used_cap_b <= td["vehicle_capacity"]
+                used_cap_b <= curr_capacity
             ).all(), "Used more backhaul than capacity: {} / {}".format(
-                used_cap_b, td["vehicle_capacity"]
+                used_cap_b, curr_capacity
             )
 
     def get_num_starts(self, td):

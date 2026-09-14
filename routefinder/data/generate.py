@@ -387,8 +387,8 @@ def generate_mtvrp_data_multi_speed_constraints(
     data = {
         "locs": locs.astype(np.float32),
         "demand_linehaul": demand_linehaul.astype(np.float32),
-        "vehicle_capacity": vehicle_capacity.astype(np.float32),
-        "speed": vehicle_speed,
+        "vehicle_capacities": vehicle_capacity.astype(np.float32),
+        "vehicle_speeds": vehicle_speed,
         "num_depots": np.full((dataset_size, 1), num_depots).astype(np.int32),
     }
 
