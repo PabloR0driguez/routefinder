@@ -512,14 +512,18 @@ class MTVRPEnv(RL4COEnvBase):
             #curr_time = torch.max(curr_time + dist, gather_by_index(td["time_windows"], next_node)[..., 0])
             curr_time = torch.max(curr_time + dist / curr_speed, gather_by_index(td["time_windows"], next_node)[..., 0],)
             #### <---
+
+            needs_next_vehicle = (next_node == 0) & (curr_node != 0)
+
+            curr_node = next_node
+            curr_time[curr_node == 0] = 0.0  # reset time for depot
+
             assert torch.all(
                 curr_time <= gather_by_index(td["time_windows"], next_node)[..., 1]
             ), "vehicle cannot start service before deadline"
             curr_time = curr_time + gather_by_index(td["service_time"], next_node)
-            curr_node = next_node
-            curr_time[curr_node == 0] = 0.0  # reset time for depot
+
             # ---> At depot, change vehicle
-            needs_next_vehicle = (next_node == 0) & (curr_node != 0)
             new_vehicle_index= curr_vehicle+ needs_next_vehicle.to(torch.long)
             can_advance = new_vehicle_index < num_vehicles
             #remember same logic, if not available lets keep current
