@@ -447,30 +447,6 @@ class MTVRPEnv(RL4COEnvBase):
             td["time_windows"][..., 0] < td["time_windows"][..., 1]
         ), "there are unfeasible time windows" #start and end times
 
-        # --> Incorporate the effect of different speeds on time windows
-        # THIS ASSERT IS GIVING TROUBLE
-        deadline = gather_by_index(td["time_windows"], next_node)[..., 1]
-        valid_time = curr_time <= deadline
-
-        failed = ~valid_time
-        #if not valid_time.all().item():
-        if failed.any().item():
-            print("Previous nodes:", curr_node[failed])
-            print("Next nodes:", next_node[failed])
-            print("Arrival times:", curr_time[failed])
-            print("Deadlines:", deadline[failed])
-            print("Vehicle indices:", curr_vehicle[failed])
-            print("Vehicle speeds:", curr_speed[failed])
-            print(
-                "Open routes:",
-                td["open_route"].squeeze(-1)[failed],
-            )
-        assert valid_time.all().item(), ("vehicle cannot start service before deadline")
-        assert torch.all(
-            td["time_windows"][..., :, 0] + d_j0 + td["service_time"]
-            <= td["time_windows"][..., 0, 1, None]
-        ), "vehicle cannot perform service and get back to depot in time."
-
         # WE ARE HERE 
         #time_windows: start_time, end_time)
         opening_times = td["time_windows"].select(dim=-1, index=0,)
@@ -508,6 +484,25 @@ class MTVRPEnv(RL4COEnvBase):
             curr_loc = gather_by_index(td["locs"], curr_node)
             next_loc = gather_by_index(td["locs"], next_node)
             dist = get_distance(curr_loc, next_loc)
+            curr_time = torch.max(curr_time + dist / curr_speed, gather_by_index(td["time_windows"], next_node)[..., 0])
+
+            # --> Incorporate the effect of different speeds on time windows
+            # THIS ASSERT IS GIVING TROUBLE
+            #Applying diagnosis
+            deadline = gather_by_index(td["time_windows"], next_node)[..., 1]
+            #valid = curr_time <= deadline
+            failure = curr_time > deadline
+
+            #if not valid_time.all().item():
+            if failure.any().item():
+                print("Prev nodes:", curr_node[failure])
+                print("Next nodes:", next_node[failure])
+                print("Arrival times:", curr_time[failure])
+                print("Deadlines:", deadline[failure])
+                print("Vehicle indices:", curr_vehicle[failure])
+                print("Vehicle speeds:", curr_speed[failure])
+                print("Open routes:", td["open_route"].squeeze(-1)[failure],)
+
 
             # distance limit (L)
             curr_length = curr_length + dist * ~(
@@ -516,20 +511,24 @@ class MTVRPEnv(RL4COEnvBase):
             assert torch.all(
                 curr_length <= td["distance_limit"].squeeze(-1)
             ), "Route exceeds distance limit"
+
             curr_length[next_node == 0] = 0.0  # reset length for depot
             # ---> This section needs to be altered for multi speeds  <---
             #curr_time = torch.max(curr_time + dist, gather_by_index(td["time_windows"], next_node)[..., 0])
+            
+            next_is_depot = next_node == 0
+            is_open_route = td["open_route"].squeeze(-1)
+            end_of_open_route = next_is_depot & is_open_route
+
+            #i am here SEP 15
+            assert torch.all(curr_time <= deadline), "vehicle cannot start service before deadline"
             curr_time = torch.max(curr_time + dist / curr_speed, gather_by_index(td["time_windows"], next_node)[..., 0],)
             #### <---
 
             needs_next_vehicle = (next_node == 0) & (curr_node != 0)
-
             curr_node = next_node
             curr_time[curr_node == 0] = 0.0  # reset time for depot
 
-            assert torch.all(
-                curr_time <= gather_by_index(td["time_windows"], next_node)[..., 1]
-            ), "vehicle cannot start service before deadline"
             curr_time = curr_time + gather_by_index(td["service_time"], next_node)
 
             # ---> At depot, change vehicle
@@ -541,6 +540,10 @@ class MTVRPEnv(RL4COEnvBase):
 
             curr_node = next_node
             curr_time[curr_node == 0] = 0.0
+
+
+
+
         # Demand constraints (C) and (B) and (MB)
         # we keep track of the current picked up linehaul and backhaul
         # and the used capacity of both
