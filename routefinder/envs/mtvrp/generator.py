@@ -205,9 +205,10 @@ class MTVRPGenerator(Generator):
         # Currently some time windows seem not possible, 
         # we generate to adjust to min speed, later to be adjusted
         min_fleet_speed = vehicle_speeds.min(dim=-1, keepdim=True).values
-
+        speed_cushion = 2.0 
+        speed_for_window= min_fleet_speed / speed_cushion
         time_windows, service_time = self.generate_time_windows(
-            locs=locs, speed=min_fleet_speed,)
+            locs=locs, speed= speed_for_window,)
 
         # Distance limit (L)
         distance_limit = self.generate_distance_limit(shape=(*batch_size, 1), locs=locs)
