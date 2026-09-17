@@ -22,6 +22,7 @@ def render(
 
     from matplotlib import cm, colormaps
     from matplotlib.colors import ListedColormap
+    from matplotlib.lines import Line2D
 
     td = td.detach().cpu()
 
@@ -40,6 +41,7 @@ def render(
     if actions is None:
         num_routes = 1
     else:
+        actions = torch.cat([torch.tensor([0]), actions, torch.tensor([0])])
         route_starts = (actions[:-1] == 0) & (actions[1:] != 0)
         num_routes = max(route_starts.sum().item(), 1)
     cmap = colormaps["turbo"]
@@ -73,8 +75,6 @@ def render(
 
     if actions is None:
         log.warning("No action in TensorDict, rendering unsorted locs")
-    else:
-        actions = torch.cat([torch.tensor([0]), actions, torch.tensor([0])])
 
     # Depot
     ax.scatter(
@@ -150,14 +150,20 @@ def render(
         else:
             print("Error: no demand")
 
-    color_idx = 0
+    color_idx = -1
     next_actions = torch.roll(actions, -1, 0)
     for ai, aj in zip(actions, next_actions):
+
         # if open and next is depot (=0), skip
         if td["open_route"].item() and aj == 0:
             continue
-        if ai == 0:
+
+        if ai.item() == 0 and aj.item() == 0:
+            continue
+        #change color only when new vehicle leaves depot
+        if ai.item() == 0 and aj.item() != 0:
             color_idx += 1
+
         from_loc = locs[ai]
         to_loc = locs[aj]
         # if any of from_loc or to_loc is depot, change color and linewidth
@@ -191,9 +197,27 @@ def render(
     # Remove the ticks
     ax.set_xticks([])
     ax.set_yticks([])
+
+    speeds = td["vehicle_speeds"][:num_routes]
+
+    ax.legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color=color_list[i],
+                label=f"Vehicle {i + 1}: {speed.item():.2f}",
+            )
+            for i, speed in enumerate(speeds)
+        ],
+        title="Speed",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+    )
+
     ax.set_title("Multi-vehicle route", pad=12)
 
-    if return_ax:
-        return ax
-    else:
+    if not return_ax:
         plt.show()
+
+    return ax
