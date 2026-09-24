@@ -9,6 +9,9 @@ from rl4co.utils.pylogger import get_pylogger
 from tensordict.tensordict import TensorDict
 from torch.distributions import Uniform
 
+#Vehicle generator based on PARCO
+from routefinder.envs.vehicle_generator import HCVRPGenerator
+
 log = get_pylogger(__name__)
 
 
@@ -102,6 +105,16 @@ class MTVRPGenerator(Generator):
         variant_preset=None,
         use_combinations=True,
         subsample=True,
+
+        # --->New parameters for different speeds and capacities
+
+        fleet_size: int = 3,
+        min_speed: float = 0.5,
+        max_speed: float = 1.0,
+        min_vehicle_capacity: float = 20.0,
+        max_vehicle_capacity: float = 41.0,
+        # <---
+
         **kwargs,
     ) -> None:
         # Location distribution
@@ -160,6 +173,23 @@ class MTVRPGenerator(Generator):
             use_combinations = False
         self.use_combinations = use_combinations
         self.subsample = subsample
+        # --->New parameters for different speeds and capacities
+        
+        self.fleet_size = fleet_size
+
+        self.fleet_size = fleet_size
+
+        self.vehicle_generator = HCVRPGenerator(
+            num_loc=num_loc,
+            num_agents=fleet_size,
+            min_capacity=min_vehicle_capacity,
+            max_capacity=max_vehicle_capacity,
+            min_speed=min_speed,
+            max_speed=max_speed,
+            scale_data=False,   )
+        # <---
+
+
 
     def _generate(self, batch_size) -> TensorDict:
         # Number of depots
@@ -172,11 +202,15 @@ class MTVRPGenerator(Generator):
             batch_size=batch_size, num_depots=self.num_depots, num_loc=self.num_loc
         )
 
-        # Vehicle capacity (C, B) - applies to both linehaul and backhaul
-        vehicle_capacity = torch.full(
-            (*batch_size, 1), self.capacity, dtype=torch.float32
-        )
-        capacity_original = vehicle_capacity.clone()
+        # ---> Adding functionality for multi vehicle speeds and capacities
+
+        vehicle_data = self.vehicle_generator(batch_size)
+        raw_vehicle_capacities = vehicle_data["capacity"]
+        vehicle_speeds = vehicle_data["speed"]
+        num_vehicles = vehicle_data["num_agents"]
+
+        capacity_original = torch.full((*batch_size, 1), self.capacity,  dtype=torch.float32,)
+        # <---
 
         # linehaul demand / delivery (C) and backhaul / pickup demand (B)
         demand_linehaul, demand_backhaul = self.generate_demands(
@@ -191,20 +225,25 @@ class MTVRPGenerator(Generator):
         open_route = self.generate_open_route(shape=(*batch_size, 1))
 
         # Time windows (TW)
-        speed = self.generate_speed(shape=(*batch_size, 1))
-        time_windows, service_time = self.generate_time_windows(
-            locs=locs,
-            speed=speed,
-        )
+
+        #We still make tw with the slowest
+        speed_for_time_windows = vehicle_speeds.min(dim=-1, keepdim=True, ).values
+
+        time_windows, service_time = self.generate_time_windows(locs=locs,  speed=speed_for_time_windows,)    
+
+        # <---
 
         # Distance limit (L)
         distance_limit = self.generate_distance_limit(shape=(*batch_size, 1), locs=locs)
 
         # scaling
         if self.scale_demand:
-            demand_backhaul /= vehicle_capacity
-            demand_linehaul /= vehicle_capacity
-            vehicle_capacity /= vehicle_capacity
+            demand_backhaul /= self.capacity
+            demand_linehaul /= self.capacity
+            vehicle_capacities = raw_vehicle_capacities / self.capacity
+        else:
+            vehicle_capacities = raw_vehicle_capacities
+
 
         # Put all variables together
         td = TensorDict(
@@ -217,10 +256,17 @@ class MTVRPGenerator(Generator):
                 "distance_limit": distance_limit,  # (L)
                 "time_windows": time_windows,  # (TW)
                 "service_time": service_time,  # (TW)
-                "vehicle_capacity": vehicle_capacity,  # (C)
+
+                #
+                "vehicle_capacity": vehicle_capacities[:, 0:1],
+                "vehicle_capacities": vehicle_capacities,
+                "speed": vehicle_speeds[:, 0:1],
+                "vehicle_speeds": vehicle_speeds,
+                "num_vehicles": num_vehicles.unsqueeze(-1),
+                #
+
                 "capacity_original": capacity_original,  # unscaled capacity (C)
                 "open_route": open_route,  # (O)
-                "speed": speed,  # common
             },
             batch_size=batch_size,
         )
@@ -229,6 +275,14 @@ class MTVRPGenerator(Generator):
             # Subsample problems based on given instructions
             td = self.subsample_problems(td)
         return td
+
+
+
+
+
+    # ---> Adding functionality for multi vehicle speeds and capacities
+    # SECTION NOW REMOVED BECAUSE WE USE PARCO's METHOD
+
 
     def subsample_problems(self, td):
         """Create subproblems starting from seed probabilities depending on their variant.
@@ -438,7 +492,8 @@ class MTVRPGenerator(Generator):
         # )[
         #     0
         # ]  # old version for single depot
-        dist_lower_bound = 2 * max_dist + 1e-6
+        distance_limit_cushion = 2.0
+        dist_lower_bound = 2 * max_dist*distance_limit_cushion + 1e-6
         max_distance_limit = torch.maximum(
             torch.full_like(dist_lower_bound, self.max_distance_limit),
             dist_lower_bound + 1e-6,
