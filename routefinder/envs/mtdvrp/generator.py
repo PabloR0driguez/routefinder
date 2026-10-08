@@ -57,6 +57,10 @@ class MTVRPGenerator(Generator):
     """MTVRP Generator.
     Class to generate instances of the MTVRP problem.
 
+    Generated duration_limit is the maximum travel-duration bound for the route,
+    initially numerically equal to the original geometric distance_limit.
+    The environment converts edge distances into vehicle-dependent durations.
+
     Args:
         num_loc: Number of locations to generate
         min_loc: Minimum location value
@@ -177,8 +181,6 @@ class MTVRPGenerator(Generator):
         
         self.fleet_size = fleet_size
 
-        self.fleet_size = fleet_size
-
         self.vehicle_generator = HCVRPGenerator(
             num_loc=num_loc,
             num_agents=fleet_size,
@@ -207,6 +209,11 @@ class MTVRPGenerator(Generator):
         vehicle_data = self.vehicle_generator(batch_size)
         raw_vehicle_capacities = vehicle_data["capacity"]
         vehicle_speeds = vehicle_data["speed"]
+
+        slowest_speed = vehicle_speeds.min(dim=-1,  keepdim=True,  ).values
+        vehicle_speeds = vehicle_speeds / slowest_speed
+
+
         num_vehicles = vehicle_data["num_agents"]
 
         capacity_original = torch.full((*batch_size, 1), self.capacity,  dtype=torch.float32,)
@@ -235,6 +242,9 @@ class MTVRPGenerator(Generator):
 
         # Distance limit (L)
         distance_limit = self.generate_distance_limit(shape=(*batch_size, 1), locs=locs)
+        # Initially use the same numerical bound as RouteFinder's distance limit.
+        # The environment will apply this value to accumulated travel duration.
+        duration_limit = distance_limit.clone()
 
         # scaling
         if self.scale_demand:
@@ -254,6 +264,7 @@ class MTVRPGenerator(Generator):
                 "demand_linehaul": demand_linehaul,  # (B)
                 "backhaul_class": backhaul_class,  # (B)
                 "distance_limit": distance_limit,  # (L)
+                "duration_limit": duration_limit,
                 "time_windows": time_windows,  # (TW)
                 "service_time": service_time,  # (TW)
 
@@ -354,6 +365,7 @@ class MTVRPGenerator(Generator):
     @staticmethod
     def _default_distance_limit(td, remove):
         td["distance_limit"][remove] = float("inf")
+        td["duration_limit"][remove] = float("inf")
         return td
 
     @staticmethod

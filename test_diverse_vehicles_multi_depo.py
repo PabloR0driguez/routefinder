@@ -198,7 +198,7 @@ if __name__ == "__main__":
 
     model = BaseLitModule.load_from_checkpoint(
         opts.checkpoint, map_location="cpu", strict=False, 
-        weights_only=False,
+        weights_only=False,  env=MTVRPEnv(),
     )
     # ---> Change in env because now we need to generate our data
     #env = MTVRPEnv()
@@ -267,6 +267,18 @@ if __name__ == "__main__":
         )
 
         ax.figure.savefig(
-            f"multidepot_multivehicle_route_{problem}.png",
+            f"multidepot_multivehicle_route_30sep_.png",
             bbox_inches="tight",
+        )
+
+        from routefinder.envs.mtdvrp.render import render_animation
+
+
+        sample_idx = 0
+
+        render_animation(
+            td=td_test[sample_idx].cpu(),
+            actions=o["best_aug_actions"][sample_idx].cpu(),
+            filename=f"route_construction_{problem}.gif",
+            interval=500,
         )

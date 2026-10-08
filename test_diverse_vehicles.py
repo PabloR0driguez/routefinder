@@ -17,7 +17,6 @@ from routefinder.data.utils import get_dataloader
 from routefinder.envs import MTVRPEnv
 # ---> New imports
 from routefinder.envs.mtvrp.generator import MTVRPGenerator
-
 # <---
 
 #New imports added for compatibility
@@ -195,9 +194,18 @@ if __name__ == "__main__":
     #    opts.checkpoint, map_location="cpu", strict=False
     #)
 
+    #model = BaseLitModule.load_from_checkpoint(
+    #    opts.checkpoint, map_location="cpu", strict=False, 
+    #    weights_only=False,
+    #)
+
+
     model = BaseLitModule.load_from_checkpoint(
-        opts.checkpoint, map_location="cpu", strict=False, 
+        opts.checkpoint,
+        map_location="cpu",
+        strict=False,
         weights_only=False,
+        env=MTVRPEnv(),
     )
     # ---> Change in env because now we need to generate our data
     #env = MTVRPEnv()
@@ -272,6 +280,6 @@ if __name__ == "__main__":
             return_ax=True,
         )
         ax.figure.savefig(
-            f"multivehicle_route_{problem}.png",
+            f"multivehicle_route_30sep_.png",
             bbox_inches="tight",
         )

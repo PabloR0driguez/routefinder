@@ -180,16 +180,16 @@ class MTVRPContextEmbeddingFull(MTVRPContextEmbeddingRouteFinder):
 
 #NEW CLASS FOR OUR FUTURE EMBEDDINGS, placeholder first
 
-class MTVRPContextEmbeddingExternal(MTVRPContextEmbeddingFull):
+class MTVRPContextEmbeddingExternal(MTVRPContextEmbeddingRouteFinder):
     def __init__(self, embed_dim=128,  default_remain_dist=10):
         EnvContext.__init__(self, embed_dim=embed_dim, step_context_dim=embed_dim + 4 + 2)
         self.default_remain_dist = default_remain_dist
 
     def _state_embedding(self, embeddings, td):
-        context_feats = super(MTVRPContextEmbeddingFull, self)._state_embedding(embeddings, td)
+        #context_feats = super(MTVRPContextEmbeddingFull, self)._state_embedding(embeddings, td)
         existing_context = super()._state_embedding(embeddings, td,)
 
-        placeholder = torch.zeros(
-            *existing_context.shape[:-1], 6, dtype=existing_context.dtype, device=existing_context.device, )
 
-        return torch.cat((existing_context, placeholder, ), dim=-1, )
+        vehicle_context = torch.cat((td["vehicle_capacity"],  td["speed"],  ),  dim=-1, )
+
+        return torch.cat((existing_context, vehicle_context, ), dim=-1, )

@@ -16,7 +16,6 @@ from routefinder.utils import rollout_actions
 
 from .generator import MTVRPGenerator
 from .selectstartnodes import get_select_start_nodes_fn
-from .utils import get_starting_points
 
 log = get_pylogger(__name__)
 
@@ -152,6 +151,8 @@ class MTVRPEnv(RL4COEnvBase):
         distance[depot2depot] = 0.0
         td["current_depot"][in_depot] = curr_node[in_depot]  # update current depot
 
+        travel_duration = distance / td["speed"]
+
         # In mtvrp we had here the vehicle change, but since we need to know when
         # are we "done" with the route, we moved it to after that is computed
 
@@ -164,13 +165,19 @@ class MTVRPEnv(RL4COEnvBase):
         )[..., 0]
         # we cannot start before we arrive and we should start at least at start times
         curr_time = not_in_depot * (
-            torch.max(td["current_time"] + distance / td["speed"], start_times)
+            torch.max(td["current_time"] + travel_duration, start_times)
             + service_time
         )
 
-        # Update current route length (reset at depot)
-        curr_route_length = not_in_depot * (td["current_route_length"] + distance)
+        # Update current route distance and duration (reset at depot)
+        current_route_length = not_in_depot * (
+            td["current_route_length"] + distance
+        )
+        current_route_duration = not_in_depot * (
+            td["current_route_duration"] + travel_duration
+        )
         total_distance = td["total_distance"] + distance
+        total_duration = td["total_duration"] + travel_duration
 
         # Linehaul (delivery) demands
         selected_demand_linehaul = gather_by_index(
@@ -194,13 +201,19 @@ class MTVRPEnv(RL4COEnvBase):
         done = visited[..., num_depots:].all(-1)
 
         # --->
-        vehicle_change_bool = in_depot & ~depot2depot
-        needs_next_vehicle = vehicle_change_bool & ~done #we finish with current vehicle when we done
+        vehicle_change_bool = in_depot & torch.logical_not(depot2depot)  #~depot2depot
+        needs_next_vehicle = vehicle_change_bool & torch.logical_not(done)  #we finish with current vehicle when we done
+        num_vehicles = td["num_vehicles"].reshape_as(td["current_vehicle"])
 
         fleet_limit = td["vehicle_speeds"].shape[1]
         new_vehicle_index = td["current_vehicle"] + needs_next_vehicle.to(torch.long) #same logic as used in mtdvrp
-        exceeds_fleet = new_vehicle_index >= fleet_limit
-        current_vehicle = torch.where(exceeds_fleet, td["current_vehicle"], new_vehicle_index)
+        #exceeds_fleet = new_vehicle_index >= fleet_limit
+        exceeds_fleet =  needs_next_vehicle & (new_vehicle_index >= num_vehicles)
+        #what should the model do we exceed fleet? Stop?
+        if exceeds_fleet.any().item():
+            raise RuntimeError("fleet-size limit was exceeded.")
+        #current_vehicle = torch.where(exceeds_fleet, td["current_vehicle"], new_vehicle_index)
+        current_vehicle = torch.where(needs_next_vehicle, new_vehicle_index, td["current_vehicle"])
 
         current_vehicle_speed = torch.gather(td["vehicle_speeds"], dim=1, index=current_vehicle[:, None])
         current_vehicle_capacity = torch.gather(td["vehicle_capacities"], dim=1, index=current_vehicle[:, None])
@@ -214,11 +227,13 @@ class MTVRPEnv(RL4COEnvBase):
         td.update(
             {
                 "current_node": curr_node,
-                "current_route_length": curr_route_length,
+                "current_route_length": current_route_length,
+                "current_route_duration": current_route_duration,
                 "current_time": curr_time,
                 "done": done,
                 "reward": reward,
                 "total_distance": total_distance,
+                "total_duration": total_duration,
                 "used_capacity_linehaul": used_capacity_linehaul,
                 "used_capacity_backhaul": used_capacity_backhaul,
                 "visited": visited,
@@ -278,6 +293,10 @@ class MTVRPEnv(RL4COEnvBase):
         distance_limit = td.get(
             "distance_limit", torch.full_like(demand_linehaul[..., :1], float("inf"))
         )
+        duration_limit = td.get(
+            "duration_limit",
+            distance_limit.clone(),
+        )
 
         # --->
 
@@ -292,6 +311,11 @@ class MTVRPEnv(RL4COEnvBase):
             vehicle_capacities = td.get("vehicle_capacity", torch.ones_like(demand_linehaul[..., :1]))
         active_capacity = vehicle_capacities[:, 0:1]
 
+        # IN THE FOLLOWING SECTION WE WILL BEGIN DEVELOPING THE FLEET SIZE CONSTRAINT
+        num_vehicles = td["num_vehicles"].to(device=device,dtype=torch.long,)
+        assert torch.all(num_vehicles >= 1), ("Each instance must have >=1 vehicle.")
+
+
         # <---
 
         # Create reset TensorDict
@@ -303,6 +327,7 @@ class MTVRPEnv(RL4COEnvBase):
                 "demand_linehaul": demand_linehaul,
                 "backhaul_class": backhaul_class,
                 "distance_limit": distance_limit,
+                "duration_limit": duration_limit,
                 "service_time": service_time,
                 "open_route": open_route,
                 "time_windows": time_windows,
@@ -313,6 +338,7 @@ class MTVRPEnv(RL4COEnvBase):
                 "speed": active_speed,
                 "vehicle_capacities": vehicle_capacities,
                 "vehicle_capacity": active_capacity,
+                "num_vehicles": num_vehicles,
                 # <---
 
                 "capacity_original": td.get(
@@ -326,12 +352,18 @@ class MTVRPEnv(RL4COEnvBase):
                 ),
                 "current_route_length": torch.zeros(
                     (*batch_size, 1), dtype=torch.float32, device=device
-                ),  # for distance limits
+                ),  # geometric route distance
+                "current_route_duration": torch.zeros(
+                    (*batch_size, 1), dtype=torch.float32, device=device
+                ),  # for duration limits
                 "current_time": torch.zeros(
                     (*batch_size, 1), dtype=torch.float32, device=device
                 ),  # for time windows
                 "total_distance": torch.full(
                     (*batch_size, 1), -1, dtype=torch.float32, device=device
+                ),  # initial-depot-selection sentinel
+                "total_duration": torch.zeros(
+                    (*batch_size, 1), dtype=torch.float32, device=device
                 ),  # for reward calculation
                 "used_capacity_backhaul": torch.zeros(
                     (*batch_size, 1), device=device
@@ -398,10 +430,15 @@ class MTVRPEnv(RL4COEnvBase):
             ..., 0:1
         ]  # note tws are the same for all depots
 
-        # Distance limit (L): do not add distance to depot if open route (O)
-        exceeds_dist_limit = (
-            td["current_route_length"] + d_ij + (d_j0 * ~td["open_route"])
-            > td["distance_limit"]
+        # Duration limit (L): do not add duration to depot if open route (O)
+        duration_ij = d_ij / td["speed"]
+        duration_j0 = d_j0 / td["speed"]
+
+        exceeds_duration_limit = (
+            td["current_route_duration"]
+            + duration_ij
+            + duration_j0 * ~td["open_route"]
+            > td["duration_limit"]
         )
 
         # Capacity constraints linehaul (C) and backhaul (B)
@@ -453,7 +490,7 @@ class MTVRPEnv(RL4COEnvBase):
             can_reach_customer
             & can_reach_depot
             & meets_demand_constraint
-            & ~exceeds_dist_limit
+            & ~exceeds_duration_limit
             & ~td["visited"]
         )
 
@@ -479,7 +516,7 @@ class MTVRPEnv(RL4COEnvBase):
             print("  exceeds_cap_backhaul:", exceeds_cap_backhaul[idx])
             print("  can_reach_customer:", can_reach_customer[idx])
             print("  can_reach_depot:", can_reach_depot[idx])
-            print("  exceeds_dist_limit:", exceeds_dist_limit[idx])
+            print("  exceeds_duration_limit:", exceeds_duration_limit[idx])
             print("  meets_demand_constraint:", meets_demand_constraint[idx])
             print("  backhaul_class:", td["backhaul_class"][idx])
             print("  visited:", td["visited"][idx])
@@ -503,41 +540,46 @@ class MTVRPEnv(RL4COEnvBase):
             depot_deadlock[:, None], depot_available, can_visit[:, :num_depots]
         )  # [b, num_depots]
 
+        # HERE WE WILL INCORPORATE THE FLEET SIZE CONSTRAINT
+        num_vehicles = td["num_vehicles"].reshape_as(td["current_vehicle"]) #reshape so is [batch_size, 1]
+        has_more_available_vehicles = td["current_vehicle"]+1 < (num_vehicles )
+        #has_pending_customers = ~td["visited"][..., num_depots:].all(-1)
+        has_pending_customers = torch.logical_not(td["visited"][..., num_depots:].all(dim=-1))
+        depot_indices = torch.arange(num_depots,  device=td.device, )
+        currently_at_depot = torch.isin(td["current_node"],  depot_indices,)
+        currently_at_customer = torch.logical_not(currently_at_depot)
+        cant_finish= currently_at_customer & has_pending_customers & torch.logical_not(has_more_available_vehicles)
+        can_visit[..., :num_depots] &= torch.logical_not(cant_finish  ).unsqueeze(-1)
+
         td.set("depot_available", depot_available)
         td.set("action_mask", can_visit)
         return td
 
     @staticmethod
     def _get_reward(td: TensorDict, actions: TensorDict) -> TensorDict:
-
-        go_from = actions  # note: we don't append any slack action here
-        go_to = torch.roll(go_from, -1, dims=1)  # [b, seq_len]
-        loc_from = gather_by_index(td["locs"], go_from)
-        loc_to = gather_by_index(td["locs"], go_to)
-
-        starting_points = get_starting_points(actions, td["num_depots"])
-        actual_depot = torch.roll(
-            starting_points, 1, dims=1
-        )  # "overwrite" the destination depot with the actual depot
-        loc_actual_depot = gather_by_index(td["locs"], actual_depot)
-
-        # Get tour length. If route is open and goes to depot, don't count the distance
-        distances = get_distance(loc_from, loc_to)  # [b, seq_len]
-        distances_to_depot = get_distance(loc_from, loc_actual_depot)  # [b, seq_len]
-
-        # where the route goes back to depot, the distance is to depot
-        is_depot = go_to < td["num_depots"]
-        distances = torch.where(
-            is_depot, distances_to_depot * ~td["open_route"], distances
+        current_loc = gather_by_index(
+            td["locs"],
+            td["current_node"],
         )
 
-        # If depot to depot, distance is 0
-        is_depot_to_depot = (go_from < td["num_depots"]) & (go_to < td["num_depots"])
-        distances = torch.where(is_depot_to_depot, torch.zeros_like(distances), distances)
+        current_depot_loc = gather_by_index(
+            td["locs"],
+            td["current_depot"],
+        )
 
-        # Sum up and return
-        tour_length = distances.sum(-1)  # [b]
-        return -tour_length  # reward is negative cost
+        final_distance = get_distance(
+            current_loc,
+            current_depot_loc,
+        )[..., None]
+
+        final_duration = final_distance / td["speed"]
+
+        total_duration = (
+            td["total_duration"]
+            + final_duration * ~td["open_route"]
+        )
+
+        return -total_duration.squeeze(-1)
 
     def _get_reward_full_rollout_old(
         self, td: TensorDict, actions: TensorDict
@@ -568,17 +610,41 @@ class MTVRPEnv(RL4COEnvBase):
         ).all(), "Invalid tour: not all customer nodes visited exactly once"
         assert (sorted_pi[:, :-n_loc] < num_depots).all(), "Invalid tour"  # why?
 
-        # Time windows (TW) and distance limits (L)
+        # we know we visited every customer, but how many trips did we do?
+        # meaning, when did we leave a depot?
+
+        depot_indices = torch.arange(num_depots, device=actions.device,)
+        is_depot_action = torch.isin(actions, depot_indices,)
+        is_customer = torch.logical_not(is_depot_action)
+
+        previous_is_depot = torch.cat([torch.ones_like(actions[:, :1],  dtype=torch.bool,  ), actions[:, :-1] < num_depots, ], dim=1,)
+        vehicles_used = (is_customer & previous_is_depot).sum(dim=1)
+        num_vehicles = td["num_vehicles"].reshape_as(vehicles_used)
+
+        assert torch.all(vehicles_used <= num_vehicles), ("validation not passed, fleet-size limit exceeded")
+
+
+
+        # Time windows (TW) and duration limits (L)
         assert torch.all(td["time_windows"] >= 0.0), "Time windows must be non-negative."
         assert torch.all(td["service_time"] >= 0.0), "Service time must be non-negative."
         assert torch.all(
             td["time_windows"][..., 0] < td["time_windows"][..., 1]
         ), "There are unfeasible time windows with start time > end time."
         assert (td["distance_limit"] >= 0).all(), "Distance limits must be non-negative."
+        assert (td["duration_limit"] >= 0).all(), "Duration limits must be non-negative."
         curr_time = torch.zeros(batch_size, dtype=torch.float32, device=td.device)
         # todo: current node need not be 0 actually but hey
         curr_node = torch.zeros(batch_size, dtype=torch.int64, device=td.device)
-        curr_length = torch.zeros(batch_size, dtype=torch.float32, device=td.device)
+        curr_distance = torch.zeros(
+            batch_size, dtype=torch.float32, device=td.device
+        )
+        curr_duration = torch.zeros(
+            batch_size, dtype=torch.float32, device=td.device
+        )
+        curr_depot = torch.zeros(
+            batch_size, dtype=torch.int64, device=td.device
+        )
 
         # ---> Preparing for multi speeds / capacities
         vehicle_speeds = td.get("vehicle_speeds", td["speed"])
@@ -590,37 +656,55 @@ class MTVRPEnv(RL4COEnvBase):
 
         for ii in range(actions.size(1)):
             next_node = actions[:, ii]
-            curr_loc = gather_by_index(td["locs"], curr_node)
-            next_loc = gather_by_index(td["locs"], next_node)
-            dist = get_distance(curr_loc, next_loc)
-
-            # distance limit (L)
-            curr_length = curr_length + dist * ~(
-                td["open_route"].squeeze(-1) & (next_node == 0)
-            )  # do not count back to depot for open route
-            assert torch.all(
-                curr_length <= td["distance_limit"].squeeze(-1)
-            ), "Route exceeds distance limit"
-            curr_length[next_node < num_depots] = 0.0  # reset length for depot
-            # --->
-            curr_time = torch.max(
-                curr_time + dist / curr_speed,
-                gather_by_index(td["time_windows"], next_node)[..., 0],
-            )        
-
-            assert torch.all(
-                curr_time <= gather_by_index(td["time_windows"], next_node)[..., 1]
-            ), "vehicle cannot start service before deadline"
-            curr_time = curr_time + gather_by_index(td["service_time"], next_node)
-            assert torch.all(
-                curr_time <= gather_by_index(td["time_windows"], next_node)[..., 1]
-            ), "vehicle cannot finish service by deadline"
-
             next_in_depot = torch.isin(next_node, depot_index)
             prev_in_depot = torch.isin(curr_node, depot_index)
-            needs_next_vehicle = next_in_depot & ~prev_in_depot  # excludes depot-to-depot
-        
-            # <---
+            depot_to_depot = prev_in_depot & next_in_depot
+
+            curr_loc = gather_by_index(td["locs"], curr_node)
+            next_loc = gather_by_index(td["locs"], next_node)
+            curr_depot_loc = gather_by_index(td["locs"], curr_depot)
+            distance = get_distance(curr_loc, next_loc)
+            distance_to_current_depot = get_distance(curr_loc, curr_depot_loc)
+
+            distance = torch.where(
+                next_in_depot,
+                distance_to_current_depot,
+                distance,
+            )
+            distance = torch.where(
+                next_in_depot & td["open_route"].squeeze(-1),
+                torch.zeros_like(distance),
+                distance,
+            )
+            distance = torch.where(
+                depot_to_depot,
+                torch.zeros_like(distance),
+                distance,
+            )
+
+            travel_duration = distance / curr_speed
+            curr_distance = curr_distance + distance
+            curr_duration = curr_duration + travel_duration
+            assert torch.all(
+                curr_duration <= td["duration_limit"].squeeze(-1)
+            ), "Route exceeds duration limit"
+
+            opening_time = gather_by_index(td["time_windows"], next_node)[..., 0]
+            deadline = gather_by_index(td["time_windows"], next_node)[..., 1]
+            curr_time = torch.maximum(
+                curr_time + travel_duration,
+                opening_time,
+            )
+            assert torch.all(
+                curr_time <= deadline
+            ), "vehicle cannot start service before deadline"
+            curr_time = curr_time + gather_by_index(td["service_time"], next_node)
+
+            curr_distance[next_in_depot] = 0.0
+            curr_duration[next_in_depot] = 0.0
+            curr_time[next_in_depot] = 0.0
+            curr_depot = torch.where(next_in_depot, next_node, curr_depot)
+            needs_next_vehicle = next_in_depot & ~prev_in_depot
 
             # ---> At depot, change vehicle
             new_vehicle_index= curr_vehicle+ needs_next_vehicle.to(torch.long)
@@ -632,7 +716,6 @@ class MTVRPEnv(RL4COEnvBase):
 
             # <---
             curr_node = next_node
-            curr_time[curr_node < num_depots] = 0.0  # reset time for depot
 
         # Demand constraints (C) and (B) and (MB)
         # we keep track of the current picked up linehaul and backhaul

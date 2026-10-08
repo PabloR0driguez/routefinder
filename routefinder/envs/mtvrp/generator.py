@@ -75,6 +75,9 @@ class MTVRPGenerator(Generator):
                 1: classic backhaul (VRPB), linehauls must be served before backhauls in a route (every customer is either, not both)
                 2: mixed backhaul (VRPMPD or VRPMB), linehauls and backhauls can be served in any order (every customer is either, not both)
         distance_limit: Distance limit
+        duration_limit: Maximum travel-duration bound for a route. Initially numerically
+            equal to distance_limit; the environment converts edge distances into
+            vehicle-dependent travel durations.
         speed: Speed of vehicle. Defaults to 1
         **kwargs: Additional keyword arguments
     """
@@ -192,11 +195,16 @@ class MTVRPGenerator(Generator):
         # Vehicle capacity (C, B) - applies to both linehaul and backhaul
         #vehicle_capacity = torch.full((*batch_size, 1), self.capacity, dtype=torch.float32)
 
-
+        #AttributeError: 'MTVRPGenerator' object has no attribute 'vehicle_generator'
+        # how to solve?
         vehicle_data = self.vehicle_generator(batch_size)
 
         raw_vehicle_capacities = vehicle_data["capacity"]
         vehicle_speeds = vehicle_data["speed"]
+
+        slowest_speed = vehicle_speeds.min(dim=-1,  keepdim=True,  ).values
+        vehicle_speeds = vehicle_speeds / slowest_speed
+
         num_vehicles = vehicle_data["num_agents"]
 
         # Reference capacity used to normalize RouteFinder demands.
@@ -232,6 +240,9 @@ class MTVRPGenerator(Generator):
 
         # Distance limit (L)
         distance_limit = self.generate_distance_limit(shape=(*batch_size, 1), locs=locs)
+        # Initially use the same numerical bound as RouteFinder's distance limit.
+        # The environment will apply this value to accumulated travel duration.
+        duration_limit = distance_limit.clone()
 
         # scaling
         if self.scale_demand:
@@ -249,6 +260,7 @@ class MTVRPGenerator(Generator):
                 "demand_linehaul": demand_linehaul,  # (B)
                 "backhaul_class": backhaul_class,  # (B)
                 "distance_limit": distance_limit,  # (L)
+                "duration_limit": duration_limit,
                 "time_windows": time_windows,  # (TW)
                 "service_time": service_time,  # (TW)
                 # ---> Modification for different capacities
@@ -341,6 +353,7 @@ class MTVRPGenerator(Generator):
     @staticmethod
     def _default_distance_limit(td, remove):
         td["distance_limit"][remove] = float("inf")
+        td["duration_limit"][remove] = float("inf")
         return td
 
     @staticmethod
