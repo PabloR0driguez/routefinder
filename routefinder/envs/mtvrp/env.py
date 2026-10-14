@@ -104,6 +104,7 @@ class MTVRPEnv(RL4COEnvBase):
         check_solution: bool = False,
         load_solutions: bool = True,
         solution_fname: str = "_sol_pyvrp.npz",
+        enforce_fleet_limit: bool = True,
         **kwargs,
     ):
         super().__init__(check_solution=check_solution, **kwargs)
@@ -124,6 +125,7 @@ class MTVRPEnv(RL4COEnvBase):
 
         self.solution_fname = solution_fname
         self.load_solutions = load_solutions
+        self.enforce_fleet_limit = enforce_fleet_limit
         self._make_spec(self.generator)
 
     def _step(self, td: TensorDict) -> TensorDict:
@@ -367,9 +369,9 @@ class MTVRPEnv(RL4COEnvBase):
         td_reset.set("action_mask", self.get_action_mask(td_reset))
         return td_reset
 
-    @staticmethod
-    def get_action_mask(td: TensorDict) -> torch.Tensor:
-        curr_node = td["current_node"]  # note that this was just updated!
+    #@staticmethod     # i need to let the env use different settings so not static
+    def get_action_mask(self, td: TensorDict) -> torch.Tensor:
+        curr_node = td["current_node"]
         locs = td["locs"]
         d_ij = get_distance(
             gather_by_index(locs, curr_node)[..., None, :], locs
@@ -456,30 +458,30 @@ class MTVRPEnv(RL4COEnvBase):
         can_visit[:, 0] = ~((curr_node == 0) & (can_visit[:, 1:].sum(-1) > 0))
 
         # Hard fleet-size constraint
-        num_vehicles = td["num_vehicles"].reshape_as(
-            td["current_vehicle"])
+        # optiona to enforce fleet size constraint
+        if self.enforce_fleet_limit:
+            num_vehicles = td["num_vehicles"].reshape_as(
+                td["current_vehicle"])
 
-        has_more_available_vehicles = (
-            td["current_vehicle"] + 1 < num_vehicles)
+            has_more_available_vehicles = (
+                td["current_vehicle"] + 1 < num_vehicles)
 
-        has_pending_customers = torch.logical_not(
-            td["visited"][..., 1:].all(dim=-1))
+            has_pending_customers = torch.logical_not(
+                td["visited"][..., 1:].all(dim=-1))
 
-        currently_at_customer = curr_node != 0
+            currently_at_customer = curr_node != 0
 
-        cant_finish_route = (
-            currently_at_customer
-            & has_pending_customers
-            & torch.logical_not(has_more_available_vehicles)
-)
+            cant_finish_route = (
+                currently_at_customer
+                & has_pending_customers
+                & torch.logical_not(has_more_available_vehicles)
+    )
 
-        # Returning to depot would require starting another vehicle.
-        can_visit[:, 0] &= torch.logical_not(cant_finish_route)
+            # Returning to depot would require starting another vehicle.
+            can_visit[:, 0] &= torch.logical_not(cant_finish_route)
 
         return can_visit
 
-
-        return can_visit
 
     def _get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
         # Append depot to actions and get sequence of locations

@@ -1,4 +1,4 @@
-def freeze_backbone(policy, train_everything=True,):
+def freeze_backbone(policy, train_everything=True, train_context_embedding=True,):
     # Freeze all the parameters in the model
     for param in policy.parameters():
         param.requires_grad = False
@@ -9,7 +9,9 @@ def freeze_backbone(policy, train_everything=True,):
     if train_everything:
         for param in policy.encoder.init_embedding.parameters():
             param.requires_grad = True
-    for param in policy.decoder.context_embedding.parameters():
-        param.requires_grad = True
+    if train_context_embedding:
+        for param in policy.decoder.context_embedding.parameters():
+            param.requires_grad = True
     return policy
 #now we go to eal.py
+#adaptations for run_eal and run_eal_dual

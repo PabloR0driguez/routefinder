@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-
-
+#init.py turns the instances into the initial embeddings, collect global and customer feats
+#and then project them
 class MTVRPInitEmbedding(nn.Module):
     """Initial embedding MTVRP.
 
@@ -231,3 +231,72 @@ class MTVRPInitEmbeddingFull(MTVRPInitEmbeddingRouteFinder):
             ),
             -1,
         )
+
+
+
+
+
+class MTVRPInitEmbeddingDual(MTVRPInitEmbeddingRouteFinder):
+
+
+    """
+    New fleet features:
+        -small vehicle capacity
+        -small vehicle speed
+        -number of small vehicles / number of customers
+        -large vehicle capacity
+        -large vehicle speed
+        -number of large vehicles / number of customers
+    """
+
+    def __init__(self,  embed_dim=128,  bias=False,  posinf_val=0.0, ):
+        MTVRPInitEmbeddingRouteFinderBase.__init__(
+            self,
+            num_global_feats=5 + 6,
+            num_cust_feats=7,
+            embed_dim=embed_dim,
+            bias=bias,
+            posinf_val=posinf_val,
+        )
+
+    def _global_feats(self, td):
+        # Get RouteFinder's five existing global features
+        existing_global_feats = super()._global_feats(td)
+
+        vehicle_capacities = td["vehicle_capacities"]
+        vehicle_speeds = td["vehicle_speeds"]
+        #description of the small-slow and large-fast vehicles fleet
+        #properties of the dual fleet
+        small_capacity = vehicle_capacities.min(dim=-1, keepdim=True, ).values
+        small_speed = vehicle_speeds.min(dim=-1, keepdim=True, ).values
+        large_capacity = vehicle_capacities.max(dim=-1, keepdim=True, ).values
+        large_speed = vehicle_speeds.max(dim=-1, keepdim=True, ).values
+
+
+        # Count the vehicles belonging to each type
+        small_vehicle_mask = (vehicle_capacities == small_capacity )
+
+        num_small = small_vehicle_mask.sum(dim=-1, keepdim=True, ).float()
+        num_large = (td["num_vehicles"].float() - num_small)
+
+
+        num_customers = td["locs"].size(-2) - 1
+        normalized_num_small = ( num_small / num_customers)
+        normalized_num_large = (num_large / num_customers)
+
+
+        fleet_feats = torch.cat(
+            (
+                small_capacity,
+                small_speed,
+                normalized_num_small,
+                large_capacity,
+                large_speed,
+                normalized_num_large,
+            ),
+            dim=-1,)
+
+        fleet_feats = fleet_feats.unsqueeze(1)
+
+        return torch.cat((existing_global_feats, fleet_feats, ), dim=-1,)
+

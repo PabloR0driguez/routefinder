@@ -125,10 +125,11 @@ def efficient_adapter_layers(
     if adapter_only:
         # Train the encoder initial embedding only if we modified it
         train_init_embedding = init_embedding_cls is not None
-
+        train_context_embedding = context_embedding_cls is not None 
         policy_new = freeze_backbone(
             policy_new,
             train_everything=train_init_embedding,
+            train_context_embedding=train_context_embedding,
         )
 
     model.policy = policy_new

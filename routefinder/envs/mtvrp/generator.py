@@ -115,6 +115,13 @@ class MTVRPGenerator(Generator):
         min_vehicle_capacity: float = 20.0,
         max_vehicle_capacity: float = 41.0,
 
+        # We add new params because of experiment with small-slow and large-fast vehicles
+        fleet_mode: str = "continuous", #default is continuous so previous code keeps working as usual
+        small_vehicle_capacity: float = 20.0,
+        large_vehicle_capacity: float = 40.0,
+        small_vehicle_speed: float = 0.5,
+        large_vehicle_speed: float = 1.0,
+
         #<---
         **kwargs,
     ) -> None:
@@ -176,6 +183,20 @@ class MTVRPGenerator(Generator):
         #---> We add new parameters
         self.speed = speed
 
+        # Dual modality for vehicle generation
+        assert fleet_mode in ("continuous", "two_type", "homogeneous"), ("fleet_mode must be either " "'continuous' or 'two_type' or 'homogeneous'.")
+
+
+        self.fleet_mode = fleet_mode
+        self.fleet_size = fleet_size
+        self.small_vehicle_capacity = small_vehicle_capacity
+        self.large_vehicle_capacity = large_vehicle_capacity
+        self.small_vehicle_speed = small_vehicle_speed
+        self.large_vehicle_speed = large_vehicle_speed
+
+
+
+
         self.vehicle_generator = HCVRPGenerator(
             num_loc=num_loc,
             num_agents=fleet_size,
@@ -187,6 +208,54 @@ class MTVRPGenerator(Generator):
 
         #<---
 
+    def generate_vehicle_data(self, batch_size):
+        # Keep the previous continuous PARCO as is
+        if self.fleet_mode == "continuous":
+            return self.vehicle_generator(batch_size)
+        num_instances = batch_size[0]
+        if self.fleet_mode == "homogeneous":
+            #for a homogeneous fleet we use 
+            vehicle_capacities = torch.full((num_instances, self.fleet_size), float(self.capacity), dtype=torch.float32,)
+            vehicle_speeds = torch.ones((num_instances, self.fleet_size), dtype=torch.float32,)
+
+            homogeneous_vehicle_data = {
+                "capacity": vehicle_capacities,
+                "speed": vehicle_speeds,
+                "num_agents": torch.full((num_instances,), self.fleet_size, dtype=torch.int64),
+            }
+
+            return homogeneous_vehicle_data
+        else:
+            #vehicle is dual
+            #we make x amount of small, from that we get big from remaingin
+            #we assign caps and speeds, first x vehicles are small and slow
+            num_instances= batch_size[0]
+            num_small = torch.randint(
+                low=1,
+                high=self.fleet_size,
+                size=(num_instances,),  #num_instances,
+            )
+            num_large = self.fleet_size - num_small
+            vehicle_indices = torch.arange(self.fleet_size)
+            small_mask = vehicle_indices < num_small.unsqueeze(-1)
+            #if small mask, apply small
+            vehicle_capacities = torch.where(
+                small_mask, self.small_vehicle_capacity, self.large_vehicle_capacity,).float()
+
+            vehicle_speeds = torch.where(
+                small_mask,  self.small_vehicle_speed, self.large_vehicle_speed,).float()
+
+            dual_vehicle_data = {
+                "capacity": vehicle_capacities,
+                "speed": vehicle_speeds,
+                "num_agents": torch.full((num_instances,), self.fleet_size, dtype=torch.int64),
+                "num_small": num_small,
+                "num_large": num_large,
+            }
+            return dual_vehicle_data
+
+
+
     def _generate(self, batch_size) -> TensorDict:
         # Locations
         locs = self.generate_locations(batch_size=batch_size, num_loc=self.num_loc)
@@ -197,7 +266,8 @@ class MTVRPGenerator(Generator):
 
         #AttributeError: 'MTVRPGenerator' object has no attribute 'vehicle_generator'
         # how to solve?
-        vehicle_data = self.vehicle_generator(batch_size)
+        #vehicle_data = self.vehicle_generator(batch_size)
+        vehicle_data = self.generate_vehicle_data(batch_size)
 
         raw_vehicle_capacities = vehicle_data["capacity"]
         vehicle_speeds = vehicle_data["speed"]
