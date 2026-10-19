@@ -105,6 +105,7 @@ class MTVRPEnv(RL4COEnvBase):
         load_solutions: bool = True,
         solution_fname: str = "_sol_pyvrp.npz",
         enforce_fleet_limit: bool = True,
+        handle_dead_ends: bool = False,
         **kwargs,
     ):
         super().__init__(check_solution=check_solution, **kwargs)
@@ -126,9 +127,27 @@ class MTVRPEnv(RL4COEnvBase):
         self.solution_fname = solution_fname
         self.load_solutions = load_solutions
         self.enforce_fleet_limit = enforce_fleet_limit
+        self.handle_dead_ends = handle_dead_ends
         self._make_spec(self.generator)
 
     def _step(self, td: TensorDict) -> TensorDict:
+        # in a step, if we fail by selecting in a way that does not allow to finish
+        #we should delete so that next action doesnt think we succeded
+        
+        if self.handle_dead_ends:
+            td.set("done", td["done"].reshape(-1))
+            td.set("reward", torch.zeros_like(td["current_node"], dtype=torch.float32))
+            stopped = td["evaluation_failed"] | td["done"]
+            if stopped.any().item():
+                # Preserve actions already stored by the decoder before merging rows.
+                result = td.clone()
+                active = ~stopped
+                if active.any().item():
+                    result[active] = self._step(td[active].clone())
+                result["done"][stopped] = True
+                return result
+            td["evaluation_steps"] += 1
+        #####
         # Get locations and distance
         prev_node, curr_node = td["current_node"], td["action"]
         prev_loc = gather_by_index(td["locs"], prev_node)
@@ -366,6 +385,15 @@ class MTVRPEnv(RL4COEnvBase):
             batch_size=batch_size,
             device=device,
         )
+        # FAILURE HANDLING NEW SECTION
+
+        if self.handle_dead_ends:
+            td_reset.set("evaluation_failed", torch.zeros_like(current_vehicle, dtype=torch.bool))
+            td_reset.set("evaluation_failure_reason", torch.zeros_like(current_vehicle))
+            td_reset.set("evaluation_steps", torch.zeros_like(current_vehicle))
+            self.evaluation_result = None
+        # 
+        
         td_reset.set("action_mask", self.get_action_mask(td_reset))
         return td_reset
 
@@ -480,6 +508,23 @@ class MTVRPEnv(RL4COEnvBase):
             # Returning to depot would require starting another vehicle.
             can_visit[:, 0] &= torch.logical_not(cant_finish_route)
 
+        if self.handle_dead_ends:
+            pending = torch.logical_not(td["visited"][..., 1:].all(dim=-1))
+            dead_end = pending & (
+                torch.logical_not(can_visit.any(dim=-1))
+                | ((curr_node == 0) & torch.logical_not(can_visit[..., 1:].any(dim=-1)))
+            )
+            newly_failed = dead_end & torch.logical_not(td["evaluation_failed"])
+            td["evaluation_failure_reason"][newly_failed] = 1  # no_feasible_action
+            td["evaluation_failed"] |= dead_end
+            stopped = td["evaluation_failed"].clone()
+            if "done" in td:
+                td.set("done", td["done"].reshape(-1) | stopped)
+                stopped |= td["done"]
+            # Padding only: _step freezes these rows while other candidates finish.
+            can_visit[stopped] = False
+            can_visit[stopped, 0] = True
+
         return can_visit
 
 
@@ -489,13 +534,27 @@ class MTVRPEnv(RL4COEnvBase):
         final_distance = get_distance(gather_by_index(td["locs"], td["current_node"]), td["locs"][..., 0, :],  )[..., None]
 
         final_duration = final_distance / td["speed"]
-
-        return -(
+        reward = -(
             td["total_duration"]
-            + final_duration * ~td["open_route"]
+            + final_duration * torch.logical_not(td["open_route"])
         ).squeeze(-1)
 
+        if self.handle_dead_ends:
+            completed = td["visited"][..., 1:].all(dim=-1)
+            incomplete = (
+                torch.logical_not(completed)
+                & torch.logical_not(td["evaluation_failed"])
+            )
+            td["evaluation_failure_reason"][incomplete] = 5  # incomplete_trajectory
+            td["evaluation_failed"] |= torch.logical_not(completed)
+            self.evaluation_result = {
+                "failed": td["evaluation_failed"].clone(),
+                "reason": td["evaluation_failure_reason"].clone(),
+                "steps": td["evaluation_steps"].clone(),
+            }
+            reward = reward.masked_fill(td["evaluation_failed"], -float("inf"))
 
+        return reward
 
 
     @staticmethod

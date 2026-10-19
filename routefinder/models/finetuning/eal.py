@@ -8,6 +8,20 @@ from routefinder.models.env_embeddings.mtvrp.init import MTVRPInitEmbeddingFull
 from .utils import freeze_backbone
 
 
+def _copy_projection(source, destination):
+    """Copy an existing feature prefix without changing Linear parameter shapes."""
+    destination.to(device=source.weight.device, dtype=source.weight.dtype)
+    with torch.no_grad():
+        destination.weight.zero_()
+        destination.weight[:, : source.in_features].copy_(source.weight)
+        if source.bias is not None:
+            destination.bias.copy_(source.bias)
+
+
+
+
+
+
 def efficient_adapter_layers(
     model,
     init_embedding_cls=MTVRPInitEmbeddingFull,
@@ -44,79 +58,35 @@ def efficient_adapter_layers(
     # Init Embedding with EAL (encoder)
     # Only modify the encoder embedding when a new class is provided
     if init_embedding_cls is not None:
-        init_embedding_old = deepcopy(
-            policy.encoder.init_embedding
-        )
+        init_embedding_old = deepcopy(policy.encoder.init_embedding)
 
         # use previous k weights and pad l new number of weights with zeros
         proj_glob_params_old = (
-            init_embedding_old.project_global_feats.weight.data
-        )
-        proj_glob_params_new = torch.cat(
-            [
-                proj_glob_params_old,
-                torch.zeros(
-                    (
-                        proj_glob_params_old.shape[0],
-                        init_embedding_num_new_feats,
-                    ),
-                    device=proj_glob_params_old.device,
-                    dtype=proj_glob_params_old.dtype,
-                ),
-            ],
-            dim=-1,
-        )
+            init_embedding_old.project_global_feats.weight.data)
+
 
         init_embed_new = init_embedding_cls(
             embed_dim=embed_dim
         )
-        init_embed_new.project_global_feats.weight.data = (
-            proj_glob_params_new
-        )
-        init_embed_new.project_customers_feats.weight.data = (
-            init_embedding_old.project_customers_feats.weight.data
-        )
+        _copy_projection(init_embedding_old.project_global_feats, init_embed_new.project_global_feats,)
+        _copy_projection(init_embedding_old.project_customers_feats, init_embed_new.project_customers_feats,)
 
+ 
         # Replace the encoder embedding only when it was modified
         policy_new.encoder.init_embedding = init_embed_new
 
     # Context Embedding with EAL (decoder)
     if context_embedding_cls is not None:
-        context_embedding_old = deepcopy(
-            policy.decoder.context_embedding
-        )
+        context_embedding_old = deepcopy( policy.decoder.context_embedding)
 
-        # use previous k weights and pad l new number of weights with zeros
-        proj_context_old = (
-            context_embedding_old.project_context.weight.data
-        )
-        proj_context_new = torch.cat(
-            [
-                proj_context_old,
-                torch.zeros(
-                    (
-                        proj_context_old.shape[0],
-                        context_embedding_num_new_feats,
-                    ),
-                    device=proj_context_old.device,
-                    dtype=proj_context_old.dtype,
-                ),
-            ],
-            dim=-1,
-        )
-
-        # Replace the context embedding with the new one
-        # that contains vehicle capacity and speed
         context_embed_new = context_embedding_cls(
             embed_dim=embed_dim
         )
-        context_embed_new.project_context.weight.data = (
-            proj_context_new
-        )
+        _copy_projection(context_embedding_old.project_context, context_embed_new.project_context,)
 
-        policy_new.decoder.context_embedding = (
-            context_embed_new
-        )
+        policy_new.decoder.context_embedding = context_embed_new
+        
+
 
     # Move the modified policy to the original policy device
     policy_new = policy_new.to(policy_device)
@@ -132,6 +102,6 @@ def efficient_adapter_layers(
             train_context_embedding=train_context_embedding,
         )
 
-    model.policy = policy_new
 
+    model.policy = policy_new
     return model

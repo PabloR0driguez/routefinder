@@ -182,7 +182,7 @@ class MTVRPContextEmbeddingFull(MTVRPContextEmbeddingRouteFinder):
 
 class MTVRPContextEmbeddingExternal(MTVRPContextEmbeddingRouteFinder):
     def __init__(self, embed_dim=128,  default_remain_dist=10):
-        EnvContext.__init__(self, embed_dim=embed_dim, step_context_dim=embed_dim + 4 + 2)
+        EnvContext.__init__(self, embed_dim=embed_dim, step_context_dim=embed_dim + 3 + 2)
         self.default_remain_dist = default_remain_dist
 
     def _state_embedding(self, embeddings, td):

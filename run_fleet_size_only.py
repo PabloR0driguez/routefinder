@@ -41,6 +41,8 @@ except AttributeError:
 
 torch.set_float32_matmul_precision("medium")
 
+FAILURE_REASONS = {
+    1: "no_feasible_action",  5: "incomplete_trajectory",}
 
 def test(
     policy,
@@ -66,58 +68,64 @@ def test(
                 td = StateAugmentation(num_augment=num_augment, augment_fn=augment_fn)(td)
 
             # Evaluate policy
-            out = policy(td, env, phase="test", num_starts=n_start, return_actions=True)
+            out = policy(td, env, phase="test", num_starts=n_start, return_actions=True, select_best=False,)
 
             # Unbatchify reward to [batch_size, num_augment, num_starts].
             reward = unbatchify(out["reward"], (num_augment, n_start))
-            print("[DEBUG] Reshaped reward:", reward.shape)
-            if n_start > 1:
-                # max multi-start reward
-                max_reward, max_idxs = reward.max(dim=-1)
-                out.update({"max_reward": max_reward})
+            details = getattr(env, "evaluation_result", None)
+            if details is not None:
+                reasons = unbatchify(details["reason"], (num_augment, n_start))
+                steps = unbatchify(details["steps"], (num_augment, n_start))
+                candidate_failed = unbatchify(details["failed"], (num_augment, n_start))
+            else:
+                candidate_failed = torch.zeros_like(reward, dtype=torch.bool)
+                reasons = torch.zeros_like(reward, dtype=torch.long)
+                steps = torch.zeros_like(reasons)
+            out.update({
+                "candidate_failed": candidate_failed,
+                "candidate_failure_reason": reasons,
+                "candidate_steps": steps,
+            })
 
-                if out.get("actions", None) is not None:
-                    # Reshape batch to [batch_size, num_augment, num_starts, ...]
-                    actions = unbatchify(out["actions"], (num_augment, n_start))
-                    out.update(
-                        {
-                            "best_multistart_actions": gather_by_index(
-                                actions, max_idxs, dim=max_idxs.dim()
-                            )
-                        }
-                    )
-                    out["actions"] = actions
+            #failed candidates cannot be chosen
+            #copy of reward where every failed candidate gets -inf
+            # successful candidates keep their score
+            reward = reward.masked_fill(candidate_failed, -float("inf"))
 
-            # Get augmentation score only during inference
-            if num_augment > 1:
-                # If multistart is enabled, we use the best multistart rewards
-                reward_ = max_reward if n_start > 1 else reward
-                max_aug_reward, max_idxs = reward_.max(dim=1)
-                print("[DEBUG] Augmentation selection")
-                print(" reward_:", reward_.shape)
-                print("  max_idxs:", max_idxs.shape)
+            #best start within each augmentation
+            max_reward, max_idxs = reward.max(dim=-1)
+            out["max_reward"] = max_reward
 
-                out.update({"max_aug_reward": max_aug_reward})
 
-                # If costs_bks is available, we calculate the gap to BKS
-                if costs_bks is not None:
-                    # note: torch.abs is here as a temporary fix, since we forgot to
-                    # convert rewards to costs. Does not affect the results.
-                    gap_to_bks = (
-                        100
-                        * (-max_aug_reward - torch.abs(costs_bks))
-                        / torch.abs(costs_bks)
-                    )
-                    out.update({"gap_to_bks": gap_to_bks})
 
-                if out.get("actions", None) is not None:
-                    actions_ = (
-                        out["best_multistart_actions"] if n_start > 1 else out["actions"]
-                    )
-                    out.update({"best_aug_actions": gather_by_index(actions_, max_idxs)})
+            if out.get("actions", None) is not None:
+                actions = unbatchify(out["actions"], (num_augment, n_start))
+                out["best_multistart_actions"] = gather_by_index(
+                    actions, max_idxs, dim=2
+                )
+                out["actions"] = actions
 
-            if out.get("gap_to_bks", None) is None:
-                out.update({"gap_to_bks": 69420})  # Dummy value
+            # Get the best augmentation.
+            max_aug_reward, max_idxs = max_reward.max(dim=1)
+
+            out.update({
+                "max_aug_reward": max_aug_reward,
+                "has_solution": torch.isfinite(max_aug_reward),
+            })
+
+            if costs_bks is not None:
+                gap_to_bks = (
+                    100
+                    * (-max_aug_reward - torch.abs(costs_bks))
+                    / torch.abs(costs_bks)
+                )
+                out["gap_to_bks"] = gap_to_bks
+
+            if out.get("actions", None) is not None:
+                out["best_aug_actions"] = gather_by_index(
+                    out["best_multistart_actions"],
+                    max_idxs,
+                )
 
             return out
 
@@ -214,7 +222,7 @@ if __name__ == "__main__":
         opts.checkpoint,
         map_location="cpu",
         strict=False,
-        weights_only=False,
+        weights_only=False, load_baseline=False,
         env=MTVRPEnv(),
     )
     # ---> Change in env because now we need to generate our data
@@ -239,12 +247,12 @@ if __name__ == "__main__":
         #and what pure masking costs in solution quality. 
         generator = MTVRPGenerator(
             num_loc=opts.size,
-            variant_preset=opts.problem if opts.problem != "all" else "all",
+            variant_preset=problem, #variant_preset=opts.problem if opts.problem != "all" else "all",
             fleet_size=opts.fleet_size,
             fleet_mode="homogeneous",
         )
-        env_constrained = MTVRPEnv(generator=generator, check_solution=False, enforce_fleet_limit=True,)
-        env_unconstrained = MTVRPEnv(generator=generator, check_solution=False, enforce_fleet_limit=False,)
+        env_constrained = MTVRPEnv(generator=generator, check_solution=False, enforce_fleet_limit=True,     handle_dead_ends=True,)
+        env_unconstrained = MTVRPEnv(generator=generator, check_solution=False, enforce_fleet_limit=False,     handle_dead_ends=True,)
 
         # random seed
         torch.manual_seed(123)
@@ -254,57 +262,86 @@ if __name__ == "__main__":
         #res = []
         unconstrained_results, constrained_results, vehicle_counts = [], [], []
 
+
         for batch in dataloader:
             source_batch = batch.clone()
 
-            # Correctness check
+            # Keep an untouched initial state for the correctness check
             td_check_con = env_constrained.reset(source_batch.clone()).to(device)
-            o_check = test(policy, td_check_con, env_constrained, num_augment=1, num_starts=1, device=device)
-            env_constrained.check_solution_validity(td_check_con, o_check["actions"])
 
-            # Real evaluation
-            td_con = env_constrained.reset(source_batch.clone()).to(device)
-            o = test(policy, td_con, env_constrained, num_augment=8, num_starts=None, device=device)
+            td_con = td_check_con.clone()
+            o = test(policy,  td_con,  env_constrained, num_augment=8,  num_starts=None, device=device,)
+            #Validate
+            solved = o["has_solution"]
+            if solved.any().item():
+                env_constrained.check_solution_validity(td_check_con[solved], o["best_aug_actions"][solved],)
             constrained_results.append(o)
 
-            td_uncon = env_unconstrained.reset(source_batch.clone()).to(device)
-            o_uncon = test(policy, td_uncon, env_unconstrained, num_augment=8, num_starts=None, device=device)
+            # PENDING UNCONSTRAINED
+            unconstrained_batch, num_customers = source_batch.clone(), source_batch["locs"].shape[-2] - 1
+            for key in ("vehicle_capacities", "vehicle_speeds"):
+                unconstrained_batch.set(key, source_batch[key][:, :1].expand(-1, num_customers).clone())
+            unconstrained_batch.set("num_vehicles", torch.full_like(source_batch["num_vehicles"], num_customers))
+
+            td_uncon = env_unconstrained.reset(unconstrained_batch).to(device)
+            o_uncon = test(policy, td_uncon, env_unconstrained, num_augment=8, num_starts=None, device=device,)
             unconstrained_results.append(o_uncon)
 
-            vehicles_used = count_vehicles_used(
-                o_uncon["best_aug_actions"]
-                )
-            vehicle_counts.append(vehicles_used.cpu())
-
+            vehicles_used = count_vehicles_used(o_uncon["best_aug_actions"])
+            vehicle_counts.append(vehicles_used)
+            ####################
 
         out = {}
         vehicle_counts = torch.cat(vehicle_counts)
-        unconstrained_rewards = torch.cat(
-            [out["max_aug_reward"] for out in unconstrained_results])
-        constrained_rewards = torch.cat(
-            [out["max_aug_reward"] for out in constrained_results])
-        exceeded_per_instance= (vehicle_counts > opts.fleet_size).float().mean().item() #bools need to be float before mean
-        constrained_cost= -constrained_rewards.mean().item()
-        unconstrained_cost= -unconstrained_rewards.mean().item()
-        masking_penalty =  (constrained_cost - unconstrained_cost) / unconstrained_cost
+        unconstrained_rewards = torch.cat([out["max_aug_reward"] for out in unconstrained_results])
+        constrained_rewards = torch.cat([out["max_aug_reward"] for out in constrained_results])
+
+        unconstrained_solved = torch.cat([out["has_solution"] for out in unconstrained_results])
+        constrained_solved = torch.cat([out["has_solution"] for out in constrained_results]) 
+        num_instances = constrained_solved.numel()
+        constrained_successes = int(constrained_solved.sum().item())
+        unconstrained_successes = int(unconstrained_solved.sum().item())
+
+        exceeded_per_instance= (vehicle_counts[unconstrained_solved] > opts.fleet_size).float().mean().item()  if unconstrained_successes else None#bools need to be float before mean
+        constrained_cost= -constrained_rewards[constrained_solved].mean().item()  if constrained_successes else None
+        unconstrained_cost= -unconstrained_rewards[unconstrained_solved].mean().item()   if unconstrained_successes else None
+        common_solved = constrained_solved & unconstrained_solved
+        #we need common_solved and the two paired averages
+        #None when there are no shared successes or the reference cost is zero, because the percentage is undefined.
+        if common_solved.any().item():
+            constrained_cost_both= -constrained_rewards[common_solved].mean().item()
+            unconstrained_cost_both= -unconstrained_rewards[common_solved].mean().item()
+            if unconstrained_cost_both != 0:
+                masking_penalty = (constrained_cost_both - unconstrained_cost_both) / unconstrained_cost_both
+        #masking_penalty =  (constrained_cost - unconstrained_cost) / unconstrained_cost
         inference_time = time.time() - start
+        num_instances = sum(out["has_solution"].numel() for out in constrained_results)
+        constrained_successes = sum(int(out["has_solution"].sum().item()) for out in constrained_results)
+        unconstrained_successes = sum(int(out["has_solution"].sum().item()) for out in unconstrained_results)
+
 
         print(
             f"FLEET_SIZE_ONLY_{problem.upper()} | "
             f"Budget: {opts.fleet_size} | "
-            f"Exceed rate: {exceeded_per_instance:.2f}% | "
-            f"Unconstrained cost: {unconstrained_cost:.3f} | "
-            f"Constrained cost: {constrained_cost:.3f} | "
-            f"Masking penalty: {masking_penalty:.2f}% | "
-            f"Inference time: {inference_time:.3f} s"
+            f"Exceed rate: {f'{exceeded_per_instance:.2%}' if exceeded_per_instance is not None else 'n/a'} | "
+            f"Unconstrained cost: {f'{unconstrained_cost:.3f}' if unconstrained_cost is not None else 'n/a'} | "
+            f"Constrained cost: {f'{constrained_cost:.3f}' if constrained_cost is not None else 'n/a'} | "
+            f"Failures: constrained {num_instances - constrained_successes}, unconstrained {num_instances - unconstrained_successes} | "
+            f"Masking penalty: {f'{masking_penalty:.2%}' if masking_penalty is not None else 'n/a'} | "
+            f"Evaluation time: {inference_time:.3f} s"
         )
 
+        dataset_name = f"MULTI_FLEET_{problem.upper()}"
+        results[dataset_name] = {
+            "cost": constrained_cost,
+            "unconstrained_cost": unconstrained_cost,
+            "exceedance_rate": exceeded_per_instance,
+            "masking_penalty": masking_penalty,
+            "constrained_failures": num_instances - constrained_successes,
+            "unconstrained_failures": num_instances - unconstrained_successes,
+            "evaluation_time": inference_time,
+        }
 
-
-        dataset_name = f"MULTI_FLEET_{opts.problem.upper()}"
-        print(f"{dataset_name} | Cost: {-out['max_aug_reward'].mean().item():.3f} | Inference time: {inference_time:.3f} s")
-        #print(f"{dataset_name} | Cost: {-out['max_aug_reward'].mean().item():.3f} | Gap: {out['gap_to_bks'].mean().item():.3f}% | Inference time: {inference_time:.3f} s")
-        results[dataset_name] = {"cost": -out["max_aug_reward"].mean().item(),"inference_time": inference_time,}
         if opts.save_results:
             # Save results with checkpoint name under results/main/
             checkpoint_name = opts.checkpoint.split("/")[-1].split(".")[0]
