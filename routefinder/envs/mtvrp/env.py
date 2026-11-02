@@ -222,16 +222,24 @@ class MTVRPEnv(RL4COEnvBase):
 
         # We apply a budget of vehicles
         #number_of_vehicles = td["vehicle_speeds"].shape[1]
-
+        # HERE WE ARE HAVING A PROBLEM WHEN CHECKING UNCONSTRAINED
         num_vehicles = td["num_vehicles"].reshape_as(td["current_vehicle"])
-        exceeds_fleet = (needs_next_vehicle & (new_vehicle_index >= num_vehicles))
-        if exceeds_fleet.any().item():
-            raise RuntimeError("Fleet limit exceeded")
-        current_vehicle = torch.where(needs_next_vehicle, new_vehicle_index, td["current_vehicle"],)
-        current_speed = torch.gather(td["vehicle_speeds"], dim=1, index=current_vehicle[:, None],)
+
+        if self.enforce_fleet_limit:
+            exceeds_fleet = needs_next_vehicle & (new_vehicle_index >= num_vehicles)
+            if exceeds_fleet.any().item():
+                raise RuntimeError("Fleet limit exceeded")
+        current_vehicle = new_vehicle_index
+
+        if self.enforce_fleet_limit:
+            attribute_index = current_vehicle
+        else:
+            attribute_index = torch.zeros_like(current_vehicle)
+
+        current_speed = torch.gather(td["vehicle_speeds"],  dim=1, index=attribute_index[:, None],)
+        current_capacity = torch.gather(td["vehicle_capacities"], dim=1, index=attribute_index[:, None],)           
         ##
-        #---> Capacity tracker
-        current_capacity = torch.gather(td["vehicle_capacities"], dim=1, index=current_vehicle[:, None])
+
         td.update(
             {
                 "current_node": curr_node,
@@ -557,8 +565,9 @@ class MTVRPEnv(RL4COEnvBase):
         return reward
 
 
-    @staticmethod
-    def check_solution_validity(td: TensorDict, actions: torch.Tensor):
+    #static: when belongs to class but does not use self, therefore now we remove this
+    #@staticmethod
+    def check_solution_validity(self, td: TensorDict, actions: torch.Tensor):
         batch_size, n_loc = td["demand_linehaul"].size()
         locs = td["locs"]
         n_loc -= 1  # exclude depot
@@ -586,8 +595,8 @@ class MTVRPEnv(RL4COEnvBase):
         vehicles_used = route_starts.sum(dim=1)
 
         num_vehicles = td["num_vehicles"].reshape_as(vehicles_used)
-
-        assert torch.all(vehicles_used <= num_vehicles), ("Validation failed: fleet size limit exceeded")
+        if self.enforce_fleet_limit:
+            assert torch.all(vehicles_used <= num_vehicles), ("Validation failed: fleet size limit exceeded")
 
         # Distance limits (L)
         assert (td["distance_limit"] >= 0).all(), "Distance limits must be non-negative."

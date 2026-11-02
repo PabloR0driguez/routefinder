@@ -153,6 +153,7 @@ def main(
             init_embedding_num_new_feats=6,
             context_embedding_num_new_feats=0,
             adapter_only=True,
+            new_features_only=True,
         )   
         context_shape = (model.policy.decoder.context_embedding.project_context.weight.shape)
         print( "Context shape:",  context_shape,)
@@ -188,6 +189,7 @@ def main(
 
     # Reset learning rate
     model.optimizer_kwargs["lr"] = lr
+    model.optimizer_kwargs["weight_decay"] = 0.0
 
     # Test model
     model.env = env

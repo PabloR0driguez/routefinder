@@ -1,3 +1,5 @@
+print("Script started", flush=True)
+#taking too long, debug
 import argparse
 import os
 import pickle
@@ -17,6 +19,8 @@ from routefinder.data.utils import get_dataloader
 from routefinder.envs import MTVRPEnv
 # ---> New imports
 from routefinder.envs.mtvrp.generator import MTVRPGenerator
+from rl4co.data.utils import load_npz_to_tensordict
+# we want traceability, so load a generated dataset of instances
 # <---
 
 #New imports added for compatibility
@@ -159,7 +163,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--datasets",
-        help="Filename of the dataset(s) to evaluate. Defaults to all under data/{problem}/ dir",
+        help="Path to one saved homogeneous test dataset",
         default=None,
     )
     parser.add_argument("--batch_size", type=int, default=1000)
@@ -182,7 +186,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_speed", type=float, default=1.5)
     parser.add_argument("--min_capacity_factor", type=float, default=0.5)
     parser.add_argument("--max_capacity_factor", type=float, default=1.5)
-    parser.add_argument("--num_instances", type=int, default=1000, help="Number of synthetic instances to generate")
+    parser.add_argument("--num_instances", type=int, default=1000, help="number of saved instances")
     #parser.add_argument("--num_depots",type=int, default=1,)
     # <---
     # Use load_from_checkpoint with map_location, which is handled internally by Lightning
@@ -217,7 +221,7 @@ if __name__ == "__main__":
     #    weights_only=False,
     #)
 
-
+    print("Loading model...", flush=True)
     model = BaseLitModule.load_from_checkpoint(
         opts.checkpoint,
         map_location="cpu",
@@ -245,6 +249,9 @@ if __name__ == "__main__":
         #No new attributes, existing instances: 
         #measure how often the vehicle budget is exceeded zero-shot 
         #and what pure masking costs in solution quality. 
+
+
+
         generator = MTVRPGenerator(
             num_loc=opts.size,
             variant_preset=problem, #variant_preset=opts.problem if opts.problem != "all" else "all",
@@ -255,21 +262,39 @@ if __name__ == "__main__":
         env_unconstrained = MTVRPEnv(generator=generator, check_solution=False, enforce_fleet_limit=False,     handle_dead_ends=True,)
 
         # random seed
-        torch.manual_seed(123)
-        td_all = generator(batch_size=[opts.num_instances])
+        #torch.manual_seed(123)
+        #td_all = generator(batch_size=[opts.num_instances])
+        print("Loading dataset...", flush=True)
+        td_all = load_npz_to_tensordict(opts.datasets)
+        td_all = td_all[:opts.num_instances]
+        # we want traceability, so load a generated dataset of instances
+        td_all["num_vehicles"] = torch.full_like(td_all["num_vehicles"],  opts.fleet_size,) #overwrite with the fleet size
+
+
+        num_customers = td_all["locs"].shape[-2] - 1
+        stored_fleet_size = td_all["vehicle_speeds"].shape[-1]
+
+
+
         dataloader = get_dataloader(td_all, batch_size=opts.batch_size)
         start = time.time()
         #res = []
         unconstrained_results, constrained_results, vehicle_counts = [], [], []
 
+        processed_instances = 0
+        total_instances = td_all.batch_size[0]
 
         for batch in dataloader:
+            print("Starting batch...", flush=True)
             source_batch = batch.clone()
 
             # Keep an untouched initial state for the correctness check
             td_check_con = env_constrained.reset(source_batch.clone()).to(device)
 
             td_con = td_check_con.clone()
+            print(
+                f"\nInstances {processed_instances + 1}–"f"{processed_instances + len(batch)} of {total_instances}",flush=True,)
+            print("  Running constrained evaluation...", flush=True)
             o = test(policy,  td_con,  env_constrained, num_augment=8,  num_starts=None, device=device,)
             #Validate
             solved = o["has_solution"]
@@ -288,8 +313,12 @@ if __name__ == "__main__":
             unconstrained_results.append(o_uncon)
 
             vehicles_used = count_vehicles_used(o_uncon["best_aug_actions"])
+            print("Vehicles used:", vehicles_used.cpu().tolist(), flush=True)
             vehicle_counts.append(vehicles_used)
+            processed_instances += len(batch)
+            print(f"  Completed {processed_instances}/{total_instances} instances",flush=True,)
             ####################
+
 
         out = {}
         vehicle_counts = torch.cat(vehicle_counts)
@@ -324,8 +353,6 @@ if __name__ == "__main__":
             f"FLEET_SIZE_ONLY_{problem.upper()} | "
             f"Budget: {opts.fleet_size} | "
             f"Exceed rate: {f'{exceeded_per_instance:.2%}' if exceeded_per_instance is not None else 'n/a'} | "
-            f"Unconstrained cost: {f'{unconstrained_cost:.3f}' if unconstrained_cost is not None else 'n/a'} | "
-            f"Constrained cost: {f'{constrained_cost:.3f}' if constrained_cost is not None else 'n/a'} | "
             f"Failures: constrained {num_instances - constrained_successes}, unconstrained {num_instances - unconstrained_successes} | "
             f"Masking penalty: {f'{masking_penalty:.2%}' if masking_penalty is not None else 'n/a'} | "
             f"Evaluation time: {inference_time:.3f} s"

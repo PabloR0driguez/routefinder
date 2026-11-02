@@ -13,8 +13,13 @@ def generate_mtvrp_instances(
     continuous_bool=False,
     dual_bool=False,
     homogeneous_bool=False,
-    seed=123,
+    seed=None,
+    split="test"
 ):
+    split_seeds = {"train": 123, "val": 124, "test": 125}
+    if seed is None:
+        seed = split_seeds[split]
+
     generated_instances = {}
     output_root = Path(__file__).resolve().parent / "output"
 
@@ -39,7 +44,7 @@ def generate_mtvrp_instances(
         td = generator(torch.Size([num_instances]))
         generated_instances["continuous"] = td
 
-        continuous_folder = output_root / "continuous"
+        continuous_folder = output_root / "continuous"/ split
         continuous_folder.mkdir(parents=True, exist_ok=True)
 
         continuous_path = continuous_folder / filename
@@ -60,7 +65,7 @@ def generate_mtvrp_instances(
         td = generator(torch.Size([num_instances]))
         generated_instances["dual"] = td
 
-        dual_folder = output_root / "dual"
+        dual_folder = output_root / "dual"/ split
         dual_folder.mkdir(parents=True, exist_ok=True)
 
         dual_path = dual_folder / filename
@@ -81,7 +86,7 @@ def generate_mtvrp_instances(
         td = generator(torch.Size([num_instances]))
         generated_instances["homogeneous"] = td
 
-        homogeneous_folder = output_root / "homogeneous"
+        homogeneous_folder = output_root / "homogeneous"/ split
         homogeneous_folder.mkdir(parents=True, exist_ok=True)
 
         homogeneous_path = homogeneous_folder / filename
@@ -95,3 +100,33 @@ def generate_mtvrp_instances(
         )
 
     return generated_instances
+
+
+
+
+if __name__ == "__main__":
+    # Save evaluation data; training data is generated on the fly.
+    split_sizes = {"val": 1000, "test": 1000}
+    num_loc = 100
+    fleet_size = num_loc
+    variants = ["cvrp", "ovrp", "vrpb", "vrpl", "ovrpb", "ovrpl", "vrpbl", "ovrpbl"]
+    total = len(split_sizes) * len(variants)
+    current = 0
+    for split, num_instances in split_sizes.items():
+        for variant_preset in variants:
+            current += 1
+            print(
+                f"\n[{current}/{total}] Generating {split} | "
+                f"{variant_preset.upper()} | {num_instances} instances "
+                f"per fleet mode",
+                flush=True,)            
+            generate_mtvrp_instances(
+                num_instances=num_instances,
+                num_loc=num_loc,
+                fleet_size=fleet_size,
+                variant_preset=variant_preset,
+                continuous_bool=True,
+                dual_bool=True,
+                homogeneous_bool=True,
+                split=split,
+            )
