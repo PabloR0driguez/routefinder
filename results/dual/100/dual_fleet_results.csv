@@ -1,0 +1,10 @@
+problem,stage,run_id,fleet_budget,instances,violations,unconstrained_solved,constrained_solved,paired_instances,paired_constrained_cost,paired_unconstrained_cost,masking_penalty_pct,evaluation_time,dataset,checkpoint
+CVRP,zero_shot,1,11,4,4,4,0,0,,,,7.383476495742798,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,11,4,4,4,0,0,,,,7.4214513301849365,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,11,4,4,4,0,0,,,,9.359158992767334,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,11,4,4,4,0,0,,,,9.76228666305542,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,11,4,4,4,0,0,,,,9.18854832649231,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,29,4,0,4,4,4,16.263078689575195,16.263078689575195,0.0,9.230162858963013,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,28,4,0,4,4,4,16.263078689575195,16.263078689575195,0.0,9.607295036315918,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,29,9,0,9,9,9,14.219233512878418,14.219233512878418,0.0,22.770368576049805,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt
+CVRP,zero_shot,1,29,16,1,16,15,15,14.789918899536133,14.789918899536133,0.0,39.163798570632935,generated_datasets/output/dual/test/cvrp_n100_instances1000_fleet100_seed125.npz,checkpoints/100/rf-transformer.ckpt

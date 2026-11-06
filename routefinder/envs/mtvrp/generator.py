@@ -236,7 +236,9 @@ class MTVRPGenerator(Generator):
                 size=(num_instances,),  #num_instances,
             )
             num_large = self.fleet_size - num_small
-            vehicle_indices = torch.arange(self.fleet_size)
+            #vehicle_indices = torch.arange(self.fleet_size)
+            #we randomize because otherwise we would have only small or only big
+            vehicle_indices =  torch.rand(num_instances, self.fleet_size).argsort(dim=-1)
             small_mask = vehicle_indices < num_small.unsqueeze(-1)
             #if small mask, apply small
             vehicle_capacities = torch.where(

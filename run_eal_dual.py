@@ -3,6 +3,7 @@
 
 import os
 from unittest.mock import patch
+import time
 
 import torch
 
@@ -47,37 +48,18 @@ from routefinder.models.model import (
 from routefinder.models.env_embeddings.mtvrp.init import MTVRPInitEmbeddingDual
 from routefinder.envs.mtvrp import MTVRPEnv, MTVRPGenerator
 
+#new imports to save results
+import csv
+import pickle
+
+
+#import also some functions from run_fleet_size_only.py so to not re do them
+from rl4co.data.utils import load_npz_to_tensordict
+from routefinder.data.utils import get_dataloader
+from run_fleet_size_only import test, count_vehicles_used
 
 # Load data into env
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# We have 3 different EAL settings: MB (mixed backhaul), MD (multi-depot), and both
-VARIANT_GEN_SETTINGS = {
-    "mb": {"backhaul_ratio": 0.3, "sample_backhaul_class": True, "num_depots": 1},
-    "md": {"backhaul_ratio": 0.2, "sample_backhaul_class": False, "num_depots": 3},
-    "both": {"backhaul_ratio": 0.3, "sample_backhaul_class": True, "num_depots": 3},
-}
-
-
-def finetune_variant_names(variant_name):
-    # 3 cases: finetune_var = "mb", "md", "both"
-    variant_names = []
-    for root, dirs, files in os.walk("data"):
-        # get dir whose name contains "finetune_variant"
-        for dir in dirs:
-            if "md" not in dir and "mb" not in dir:
-                continue
-            if variant_name == "mb":
-                if "md" in dir:
-                    continue
-            elif variant_name == "md":
-                if "mb" in dir:
-                    continue
-            else:
-                if not ("mb" in dir and "md" in dir):
-                    continue
-            variant_names.append(dir)
-    return variant_names
 
 
 # Load checkpoint
@@ -113,10 +95,12 @@ def load_from_checkpoint_no_setup(
 def main(
     path,
     model_type="rf",
-    train_type="eal-adapter",
-    finetune_variant="dual",
-    lr=3e-4,
-    test_zero_shot=False,
+    datasets=None,
+    fleet_size=100,
+    num_instances=100,
+    eval_batch_size=4,
+    run_id=1,
+    save_results=True,
 ):
     if "rf" in model_type:
         if "moe" in model_type:
@@ -136,44 +120,15 @@ def main(
         raise ValueError("Model type not recognized: {}".format(model_type))
 
     model = model.to(device)
-
-
-
-
-
-
-
-
-    if "eal" in train_type:
-
-        model = efficient_adapter_layers(
-            model,
-            init_embedding_cls=MTVRPInitEmbeddingDual,
-            context_embedding_cls=None,
-            init_embedding_num_new_feats=6,
-            context_embedding_num_new_feats=0,
-            adapter_only=True,
-            new_features_only=True,
-        )   
-        context_shape = (model.policy.decoder.context_embedding.project_context.weight.shape)
-        print( "Context shape:",  context_shape,)
-    else:
-        raise ValueError(
-            "Training type not recognized: {}. Choose from ['eal', 'al', 'scratch']".format(
-                train_type
-            )
-        )
-
-
-    # Create env: the new setting is with backhaul sampling (so we have the new MB variants)
-    # and also we have slightly more backhauls
-    #Shall we try the minimum intervention setting with all congurations? 
-    # Or only the most basic CVRP?  
-
+    print("Loading dataset...", flush=True)
+    problem = os.path.basename(datasets).split("_")[0].lower()
+    td_test = load_npz_to_tensordict(datasets)[:num_instances]
+    location_amount=td_test["locs"].shape[-2] - 1
+    #locs has the instances locations, -2 is the second to last dim aka node count, -1 deletes depot
     generator = MTVRPGenerator(
-        num_loc=20,
-        variant_preset="cvrp",
-        fleet_size=20,
+        num_loc= location_amount,
+        variant_preset=problem,
+        fleet_size=  fleet_size,
         fleet_mode="two_type",
         small_vehicle_capacity=20.0,
         large_vehicle_capacity=40.0,
@@ -181,127 +136,236 @@ def main(
         large_vehicle_speed=1.0,
     )
 
-    env = MTVRPEnv(
-        generator=generator,
-        check_solution=False,
+
+    model = efficient_adapter_layers(
+        model,
+        init_embedding_cls=MTVRPInitEmbeddingDual,
+        context_embedding_cls=None,
+        init_embedding_num_new_feats=6,
+        context_embedding_num_new_feats=0,
+        adapter_only=True,
     )
 
 
-    # Reset learning rate
-    model.optimizer_kwargs["lr"] = lr
-    model.optimizer_kwargs["weight_decay"] = 0.0
+    # Evaluate the saved instances
+    policy = model.policy.to(device).eval()
+    results = {}
+    env_constrained = MTVRPEnv(generator=generator,check_solution=False,   enforce_fleet_limit=True,  handle_dead_ends=True,)
+    #
+    env_unconstrained = MTVRPEnv(generator=generator, check_solution=False, enforce_fleet_limit=True, handle_dead_ends=True,)
+    td_all = td_test.clone()
+    num_customers = td_all["locs"].shape[-2] - 1
+    stored_fleet_size = td_all["vehicle_capacities"].shape[-1]
+    for key in ("vehicle_capacities", "vehicle_speeds"):
+        td_all[key] = td_all[key][:, :fleet_size].clone()
+    td_all["num_vehicles"] = torch.full_like(td_all["num_vehicles"], fleet_size)
 
-    # Test model
-    model.env = env
-    model.data_cfg["batch_size"] = 16
-    model.data_cfg["val_batch_size"] = 16
-    model.data_cfg["test_batch_size"] = 256
-    model.data_cfg["train_data_size"] = 256  # instead of 100k
-    model.data_cfg["val_data_size"] = 64
-    model.data_cfg["test_data_size"] = 64
-    model.setup()
+    # On a test no solution was found, this mini section will eval capacities
+    capacities = td_all["vehicle_capacities"]
+    print("Total demand:",
+          td_all["demand_linehaul"].sum(-1).tolist(), flush=True)
+    print("Total fleet capacity:",
+          capacities.sum(-1).tolist(), flush=True)
+    print("Both capacity types present:",
+          (capacities.min(dim=-1).values
+           < capacities.max(dim=-1).values).tolist(), flush=True)
+    #-------
+    reference_size = max(num_customers, fleet_size)
+    repeats = (reference_size + fleet_size - 1) // fleet_size
+
+    dataloader = get_dataloader(td_all, batch_size=eval_batch_size)
+    start = time.time()
+    unconstrained_results, constrained_results, vehicle_counts = [], [], []
+
+    processed_instances = 0
+    total_instances = td_all.batch_size[0]
 
 
-    # Test model
-    logger = False
-    rich_model_summary = RichModelSummary(max_depth=3)
-    speed_monitor = SpeedMonitor(
-        intra_step_time=True, inter_step_time=True, epoch_time=True
+    for batch in dataloader:
+        print("Starting batch...", flush=True)
+        source_batch = batch.clone()
+
+        # Keep an untouched initial state for the correctness check.
+        td_check_con = env_constrained.reset(source_batch.clone()).to(device)
+        td_con = td_check_con.clone()
+
+        print(
+            f"Instances {processed_instances + 1}–"f"{processed_instances + len(batch)} of {total_instances}",
+            flush=True,)
+
+        o = test(policy, td_con, env_constrained, num_augment=8, num_starts=None, device=device,)
+
+        # Validate.
+        solved = o["has_solution"]
+        if solved.any().item():
+            env_constrained.check_solution_validity(
+                td_check_con[solved], o["best_aug_actions"][solved]
+            )
+        constrained_results.append(o)
+
+        # UNCONSTRAINED: repeat the whole fleet instead of vehicle 0.
+        unconstrained_batch = source_batch.clone()
+        for key in ("vehicle_capacities", "vehicle_speeds"):
+            unconstrained_batch.set(
+                key,
+                source_batch[key]
+                .repeat(1, repeats)[:, :reference_size]
+                .clone(),
+            )
+        unconstrained_batch.set(
+            "num_vehicles",
+            torch.full_like(source_batch["num_vehicles"], reference_size),
+        )
+
+        td_check_uncon = env_unconstrained.reset(unconstrained_batch).to(device)
+        td_uncon = td_check_uncon.clone()
+
+        o_uncon = test(policy, td_uncon, env_unconstrained,num_augment=8, num_starts=None, device=device,)
+
+        solved = o_uncon["has_solution"]
+        if solved.any().item():
+            env_unconstrained.check_solution_validity(
+                td_check_uncon[solved],
+                o_uncon["best_aug_actions"][solved],
+            )
+        unconstrained_results.append(o_uncon)
+
+        vehicles_used = count_vehicles_used(o_uncon["best_aug_actions"])
+        print("Vehicles used:", vehicles_used.cpu().tolist(), flush=True)
+        vehicle_counts.append(vehicles_used)
+
+        processed_instances += len(batch)
+        print(
+            f"Completed {processed_instances}/{total_instances}",
+            flush=True,
+        )
+
+    out = {}
+    vehicle_counts = torch.cat(vehicle_counts)
+    unconstrained_rewards = torch.cat([out["max_aug_reward"] for out in unconstrained_results])
+    constrained_rewards = torch.cat([out["max_aug_reward"] for out in constrained_results])
+
+    unconstrained_solved = torch.cat([out["has_solution"] for out in unconstrained_results])
+    constrained_solved = torch.cat([out["has_solution"] for out in constrained_results]) 
+    num_instances = constrained_solved.numel()
+    constrained_successes = int(constrained_solved.sum().item())
+    unconstrained_successes = int(unconstrained_solved.sum().item())
+
+    exceeded_per_instance= (vehicle_counts[unconstrained_solved] > fleet_size).float().mean().item()  if unconstrained_successes else None#bools need to be float before mean
+    constrained_cost= -constrained_rewards[constrained_solved].mean().item()  if constrained_successes else None
+    unconstrained_cost= -unconstrained_rewards[unconstrained_solved].mean().item()   if unconstrained_successes else None
+    constrained_cost_both = unconstrained_cost_both = masking_penalty = None
+    common_solved = constrained_solved & unconstrained_solved
+    #we need common_solved and the two paired averages
+    #None when there are no shared successes or the reference cost is zero, because the percentage is undefined.
+    if common_solved.any().item():
+        constrained_cost_both= -constrained_rewards[common_solved].mean().item()
+        unconstrained_cost_both= -unconstrained_rewards[common_solved].mean().item()
+        if unconstrained_cost_both != 0:
+            masking_penalty = (constrained_cost_both - unconstrained_cost_both) / unconstrained_cost_both
+    #masking_penalty =  (constrained_cost - unconstrained_cost) / unconstrained_cost
+    inference_time = time.time() - start
+    num_instances = sum(out["has_solution"].numel() for out in constrained_results)
+    constrained_successes = sum(int(out["has_solution"].sum().item()) for out in constrained_results)
+    unconstrained_successes = sum(int(out["has_solution"].sum().item()) for out in unconstrained_results)
+
+
+    print(
+        f"DUAL_FLEET_{problem.upper()} | "
+        f"Budget: {fleet_size} | "
+        f"Exceed rate: {f'{exceeded_per_instance:.2%}' if exceeded_per_instance is not None else 'n/a'} | "
+        f"Failures: constrained {num_instances - constrained_successes}, unconstrained {num_instances - unconstrained_successes} | "
+        f"Masking penalty: {f'{masking_penalty:.2%}' if masking_penalty is not None else 'n/a'} | "
+        f"Evaluation time: {inference_time:.3f} s"
     )
-    #lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    max_epochs = 10
-    trainer = RL4COTrainer(
-        accelerator="auto",
-        devices=1,
-        max_epochs=max_epochs,
-        logger=logger,
-        #callbacks=[rich_model_summary, speed_monitor, lr_monitor],
-        callbacks=[rich_model_summary, speed_monitor],
-
-    )
-
-    # Validate and test zero-shot generalization reporting
-    trainer.validate(model)
-    if test_zero_shot:
-        print("Testing zero-shot generalization")
-        log_dict = model.log_dict
-
-        def log_zero_shot_metrics(metrics, *args, **kwargs):
-            metrics = {
-                ("zero_shot/" + name.removeprefix("test/"))
-                if name.startswith("test/") else name: value
-                for name, value in metrics.items()
-            }
-            return log_dict(metrics, *args, **kwargs)
-
-        with patch.object(model, "log_dict", log_zero_shot_metrics):
-            #trainer.test(model)
-            test_results = trainer.test(model)
-            test_cost = -test_results[0]["test/max_aug_reward"]
-            print( "test cost:",  test_cost,)
-
-    # Main training loop
-    trainer.fit(model)
-
-    # Test model
-
-    test_results = trainer.test(model)
-
-    test_reward = test_results[0]["test/max_aug_reward"]
-    test_cost = -float(test_reward)
-
-    print(f"DUAL_FLEET_EAL | Test cost: {test_cost:.6f}")
-    print("Finished training")
+    dataset_name = f"DUAL_FLEET_{problem.upper()}"
+    results[dataset_name] = {
+        "cost": constrained_cost,
+        "unconstrained_cost": unconstrained_cost,
+        "exceedance_rate": exceeded_per_instance,
+        "masking_penalty": masking_penalty,
+        "constrained_failures": num_instances - constrained_successes,
+        "unconstrained_failures": num_instances - unconstrained_successes,
+        "evaluation_time": inference_time,
+    }
 
 
-    print("Finished training")
-    #wandb.finish()
+    #unlike homogeneous, will keep the foresight to save as csv as we run
+    if save_results:
+        stage = "zero_shot"
 
+        row = {
+            "problem": problem.upper(), "stage": stage,
+            "run_id": run_id,
+            "fleet_budget": fleet_size, "instances": num_instances,
+            "violations": int((vehicle_counts[unconstrained_solved] > fleet_size).sum().item()),
+            "unconstrained_solved": unconstrained_successes,
+            "constrained_solved": constrained_successes,
+            "paired_instances": int(common_solved.sum().item()),
+            "paired_constrained_cost": constrained_cost_both,
+            "paired_unconstrained_cost": unconstrained_cost_both,
+            "masking_penalty_pct": (100 * masking_penalty if masking_penalty is not None else None),
+            "evaluation_time": inference_time,
+            "dataset": datasets,
+            "checkpoint": path,
+        }
+        results[dataset_name].update(row)
+
+        # Save dual results separately from the homogeneous experiment.
+        savedir = f"results/dual/{location_amount}/"
+        os.makedirs(savedir, exist_ok=True)
+
+        checkpoint_name = os.path.splitext(os.path.basename(path))[0]
+        filename = (
+            f"{checkpoint_name}_{problem}_{stage}"
+            f"_fleet{fleet_size}_n{num_instances}_run{run_id}.pkl"
+        )
+
+        with open(savedir + filename, "wb") as file:
+            pickle.dump(results, file)
+
+        with open(
+            savedir + "dual_fleet_results.csv",
+            "a", newline="", encoding="utf-8"
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=list(row))
+            if file.tell() == 0:
+                writer.writeheader()
+            writer.writerow(row)
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model_type", type=str, default="rf")
     parser.add_argument(
-        "--model_type", type=str, default="rf", help="Model type: rf, mvmoe, mtpomo"
+        "--checkpoint",
+        type=str,
+        default="checkpoints/100/rf-transformer.ckpt",
     )
-    parser.add_argument("--experiment", type=str, default="eal-adapter", help="Experiment type")
+    parser.add_argument("--datasets", type=str, required=True)
+    parser.add_argument("--fleet_size", type=int, default=100)
+    parser.add_argument("--num_instances", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_runs", type=int, default=1)
     parser.add_argument(
-        "--variants_finetune", type=str, default="dual", help="Variants to finetune on"
+        "--save-results",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
-    parser.add_argument(
-        "--checkpoint", type=str, default="checkpoints/100/rf-transformer.ckpt"
-    )
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--num_runs", type=int, default=3)
-
     args = parser.parse_args()
 
-    # available_experiments = ["eal-full", "eal-adapter", "al-full", "al-adapter", "scratch"]
-    available_experiments = ["eal-adapter"]
-    if args.experiment == "all":
-        exps = available_experiments
-    else:
-        exps = [args.experiment]
-        assert all(
-            [e in available_experiments for e in exps]
-        ), f"Invalid experiment: {exps}. Choose from {available_experiments}"
+    for i in range(args.num_runs):
+        print(f"Evaluation run {i + 1}/{args.num_runs}", flush=True)
 
-    #available_variants = ["mb", "md", "both"]  # mixed backhaul, multi-depot, both
-    available_variants = ["dual"]
-    if args.variants_finetune == "all":
-        variants = available_variants
-    else:
-        variants = [args.variants_finetune]
-        assert all(
-            [v in available_variants for v in variants]
-        ), f"Invalid variant: {variants}. Choose from {available_variants}"
-
-    for finetune_variant in variants:
-        print(f"Finetuning on {finetune_variant} variants")
-        for exp in exps:
-            print(f"Training for {exp}")
-            for i in range(args.num_runs):
-                print(f"Run {i+1}/{args.num_runs}")
-                main(args.checkpoint, args.model_type, exp, finetune_variant, args.lr)
+        main(
+            path=args.checkpoint,
+            model_type=args.model_type,
+            datasets=args.datasets,
+            fleet_size=args.fleet_size,
+            num_instances=args.num_instances,
+            eval_batch_size=args.batch_size,
+            run_id=i + 1,
+            save_results=args.save_results,
+        )
