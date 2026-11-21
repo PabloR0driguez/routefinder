@@ -559,6 +559,8 @@ class MTVRPEnv(RL4COEnvBase):
                 "failed": td["evaluation_failed"].clone(),
                 "reason": td["evaluation_failure_reason"].clone(),
                 "steps": td["evaluation_steps"].clone(),
+                "route_cost": -reward, #added because we will mask to -inf for failed instances, but we need to save it for the fine tuning: what to do if unfeasible?
+                "unserved_customers": (~td["visited"][..., 1:]).sum(dim=-1),
             }
             reward = reward.masked_fill(td["evaluation_failed"], -float("inf"))
 

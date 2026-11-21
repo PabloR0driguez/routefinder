@@ -29,6 +29,7 @@ def efficient_adapter_layers(
     init_embedding_num_new_feats=1,
     context_embedding_num_new_feats=3,
     adapter_only=False,
+    new_features_only=False, train_fleet_encoder=False,
 ):
     """Efficient Active Layers.
     Keep the model the same, replace the embeddings with new zero-padded
@@ -90,9 +91,40 @@ def efficient_adapter_layers(
 
     # Move the modified policy to the original policy device
     policy_new = policy_new.to(policy_device)
+    #I AM HERE
+    if new_features_only:
+        if context_embedding_cls is None or context_embedding_num_new_feats <= 0:
+            raise ValueError("new_features_only requires new context features")
+
+        #Freeze everything
+        for parameter in policy_new.parameters():
+            parameter.requires_grad_(False)
+
+        #weights are stored in a single matrix, so we need to freeze the old columns and keep the new ones trainable
+        context_weight = policy_new.decoder.context_embedding.project_context.weight
+        context_weight.requires_grad_(True)
+
+        #count the old params
+        num_old_features = context_weight.shape[-1] - context_embedding_num_new_feats
+
+        # Old and new columns belong to one weight matrix.
+        # Block gradients for the old columns; keep gradients for the new ones.
+        def freeze_old_context_columns(gradient):
+            gradient = gradient.clone()
+            gradient[:, :num_old_features] = 0 #grad for new features only non-zero
+            return gradient
+        #As per pytorch documentation:
+        # "The hook will be called every time a gradient with respect to the Tensor is computed"
+        # so when the gradient of the weight (called context_weight is computed, the hook will use the function freeze...)
+        context_weight.register_hook(freeze_old_context_columns)
+        if train_fleet_encoder:
+            fleet_encoder = policy_new.decoder.context_embedding.fleet_encoder
+            for parameter in fleet_encoder.parameters():
+                parameter.requires_grad_(True)
+
 
     # If adapter_only is enabled, freeze the backbone
-    if adapter_only:
+    elif adapter_only:
         # Train the encoder initial embedding only if we modified it
         train_init_embedding = init_embedding_cls is not None
         train_context_embedding = context_embedding_cls is not None 
