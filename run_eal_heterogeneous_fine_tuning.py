@@ -4,7 +4,9 @@
 
 import argparse
 from pathlib import Path
-
+import csv
+import json
+import time
 import torch
 
 # Reuse the evaluator's TorchRL compatibility setup and checkpoint loader.
@@ -20,6 +22,81 @@ from routefinder.models.env_embeddings.mtvrp.context import (
 from routefinder.models.finetuning.eal import efficient_adapter_layers
 from routefinder.models.model import RouteFinderBase
 from run_fleet_size_only import test
+
+"""Fine-tune current-vehicle or learned fleet context through EAL on continuous CVRP."""
+
+import argparse
+import csv
+import json
+import time
+from pathlib import Path
+
+import torch
+
+# Reuse the evaluator's TorchRL compatibility setup and checkpoint loader.
+from run_eal_heterogeneous import device, load_from_checkpoint_no_setup
+
+from rl4co.data.utils import load_npz_to_tensordict
+from rl4co.utils.ops import unbatchify
+from routefinder.data.utils import get_dataloader
+from routefinder.envs.mtvrp import MTVRPEnv, MTVRPGenerator
+from routefinder.models.env_embeddings.mtvrp.context import (
+    MTVRPContextEmbeddingCurrentVehicle,
+    MTVRPContextEmbeddingFleet,
+)
+from routefinder.models.finetuning.eal import efficient_adapter_layers
+from routefinder.models.model import RouteFinderBase
+from run_fleet_size_only import test
+
+
+def create_run_folder(root):
+    root.mkdir(parents=True, exist_ok=True)
+    run_number = 1
+    while True:
+        folder = root / f"run_{run_number:03d}"
+        try:
+            folder.mkdir()
+            return folder
+        except FileExistsError:
+            run_number += 1
+
+
+def save_run(folder, context, num_new_features, step, config, metrics):
+    weights = {
+        "completed_steps": step,
+        "new_eal_columns": (
+            context.project_context.weight[:, -num_new_features:]
+            .detach().cpu().clone()
+        ),
+    } #we select only the new EAL columns
+    #with detach().cpu().clone() we detach the grad, move to cpu and make copy indepentdent
+
+    if hasattr(context, "fleet_encoder"):
+        weights["fleet_encoder_state_dict"] = {
+            name: value.detach().cpu().clone()
+            for name, value in context.fleet_encoder.state_dict().items()
+        }
+
+    temporary_weights = folder / "adaptation.tmp"
+    torch.save(weights, temporary_weights)
+    temporary_weights.replace(folder / "adaptation.pt")
+
+    (folder / "config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    ) #save as json
+
+    fields = [
+        "stage", "step", "loss", "mean_unserved", "instances", "completed",
+        "paired_instances", "paired_cost", "elapsed_seconds",
+    ]
+
+    temporary_metrics = folder / "metrics.tmp"
+    with temporary_metrics.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(metrics)
+
+    temporary_metrics.replace(folder / "metrics.csv")
 
 
 def limit_fleet(instances, fleet_size):
@@ -51,21 +128,33 @@ def validation_rewards(policy, env, instances, batch_size):
 def print_comparison(before_rewards, after_rewards):
     before_solved = torch.isfinite(before_rewards)
     after_solved = torch.isfinite(after_rewards)
+
     print(f"Completed before: {before_solved.sum().item()}/{len(before_rewards)}")
     print(f"Completed after:  {after_solved.sum().item()}/{len(after_rewards)}")
 
-    # Compare route cost only on instances completed in both evaluations.
     common = before_solved & after_solved
+    before_cost, after_cost = None, None
     if common.any().item():
         before_cost = -before_rewards[common].mean().item()
         after_cost = -after_rewards[common].mean().item()
-        print(f"Paired cost ({common.sum().item()} instances): {before_cost:.4f} -> {after_cost:.4f}")
+        print(
+            f"Paired cost ({common.sum().item()} instances): "
+            f"{before_cost:.4f} -> {after_cost:.4f}"
+        )
     else:
         print("No instances completed in both evaluations.")
+    return {
+        "paired_instances": int(common.sum().item()),
+        "before_cost": before_cost,
+        "after_cost": after_cost,
+    }
+
+
 
 
 def main(args):
     # This pilot uses the CVRP cost bound in the failure penalty below.
+    run_started = time.perf_counter()
     problem = Path(args.datasets).name.split("_")[0].lower()
     if problem != "cvrp":
         raise ValueError("Use a continuous-fleet CVRP validation dataset for this pilot.")
@@ -145,10 +234,66 @@ def main(args):
     trainable_parameters = [ p for p in policy.parameters() if p.requires_grad]
 
     optimizer = torch.optim.Adam(trainable_parameters, lr=args.lr, weight_decay=0.0,)
+    # I AM HERE; WERE WE ADD INFO TO SAVE THE WEIGHTS OF THE FINE TUNING
+    mode = "fleet_context" if args.fleet_context else "current_vehicle"
+    run_root = Path(__file__).resolve().parent / args.output_dir / mode
+    run_folder = create_run_folder(run_root)
+
+    print("Saving run to:", run_folder, flush=True)
+
+    config = {
+        **vars(args),
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "datasets": str(Path(args.datasets).resolve()),
+        "run_folder": str(run_folder),
+        "problem": problem,
+        "fleet_mode": "continuous",
+        "num_customers": num_customers,
+        "stored_fleet_size": pool_size,
+        "validation_instances": len(td_val),
+        "context_class": context_cls.__name__,
+        "embed_dim": policy.decoder.context_embedding.embed_dim,
+        "num_new_features": num_new_features,
+        "initialization_seed": 123 if args.fleet_context else None,
+        "training_seed": 123,
+        "validation_seed": 124,
+        "train_batch_size": 16,
+        "train_num_starts": 8,
+        "train_decode_type": "multistart_sampling",
+        "validation_num_augment": 8,
+        "validation_augment_fn": "dihedral8",
+        "validation_num_starts": "env.get_num_starts(td)",
+        "validation_decode_type": policy.test_decode_type,
+        "penalty_per_unserved_customer": 3.0 * num_customers,
+        "gradient_clip_norm": 1.0,
+        "weight_decay": 0.0,
+        "save_every_updates": 25,
+        "device": str(device),
+        "torch_version": str(torch.__version__),
+    }
+
+    if args.fleet_context:
+        config["fleet_encoder_num_heads"] = (
+            fleet_encoder.veh_encoder_self_attention.num_heads
+        )
+
+    (run_folder / "config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
+
 
 
     print("Validation before training...", flush=True)
     before_rewards = validation_rewards(policy, env, td_val, args.batch_size)
+
+    metrics = [{
+        "stage": "validation_before",
+        "step": 0,
+        "instances": len(before_rewards),
+        "completed": int(torch.isfinite(before_rewards).sum().item()),
+        "elapsed_seconds": round(time.perf_counter() - run_started, 3),
+    }]
+
 
     # Generate fresh training instances independently of the saved validation set.
     torch.manual_seed(123)
@@ -198,6 +343,33 @@ def main(args):
                 flush=True,
             )
 
+        if step == 1 or step % 25 == 0 or step == args.steps:
+            metrics.append({
+                "stage": "train",
+                "step": step,
+                "loss": loss.item(),
+                "mean_unserved": violation.float().mean().item(),
+                "instances": 16,
+                "elapsed_seconds": round(time.perf_counter() - run_started, 3),
+            })
+
+            # Save at the existing progress intervals to retain training progress.
+            save_run(
+                run_folder,
+                policy.decoder.context_embedding,
+                num_new_features,
+                step,
+                config,
+                metrics,
+            )
+
+            print(
+                f"Update {step}/{args.steps} | Loss: {loss.item():.4f} | "
+                f"Mean unserved: {violation.float().mean().item():.2f}",
+                flush=True,
+            )
+
+
     print("Old columns unchanged:", torch.equal(weights_before[:, :-num_new_features], context_weight[:, :-num_new_features]))
     print("New columns changed:", not torch.equal(weights_before[:, -num_new_features:], context_weight[:, -num_new_features:]))
     # next 10 lines are only for debugging, have no effect
@@ -215,8 +387,34 @@ def main(args):
     
     print("Validation after training...", flush=True)
     after_rewards = validation_rewards(policy, env, td_val, args.batch_size)
-    print_comparison(before_rewards, after_rewards)
+    comparison = print_comparison(before_rewards, after_rewards)
 
+    # Both evaluations are needed to identify the shared successful instances.
+    metrics[0].update({
+        "paired_instances": comparison["paired_instances"],
+        "paired_cost": comparison["before_cost"],
+    })
+
+    metrics.append({
+        "stage": "validation_after",
+        "step": args.steps,
+        "instances": len(after_rewards),
+        "completed": int(torch.isfinite(after_rewards).sum().item()),
+        "paired_instances": comparison["paired_instances"],
+        "paired_cost": comparison["after_cost"],
+        "elapsed_seconds": round(time.perf_counter() - run_started, 3),
+    })
+
+    save_run(
+        run_folder,
+        policy.decoder.context_embedding,
+        num_new_features,
+        args.steps,
+        config,
+        metrics,
+    )
+
+    print("Saved weights, configuration and metrics to:", run_folder, flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -230,4 +428,5 @@ if __name__ == "__main__":
     # Start with the original RouteFinder EAL learning rate.
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--fleet_context", action="store_true")
+    parser.add_argument("--output_dir", default="results_hypothesis/heterogeneous", help="Where to save run folders",)
     main(parser.parse_args())
