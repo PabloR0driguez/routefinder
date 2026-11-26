@@ -1,0 +1,8 @@
+stage,step,loss,mean_unserved,instances,completed,paired_instances,paired_cost,elapsed_seconds
+validation_before,0,,,100,100,100,16.02798843383789,68.813
+train,1,-4.977246284484863,0.0,16,,,,70.467
+train,25,-0.504742443561554,0.0,16,,,,104.328
+train,50,-0.2420368492603302,0.0,16,,,,139.487
+train,75,-0.5401184558868408,0.0,16,,,,175.298
+train,100,-0.387262761592865,0.0,16,,,,210.601
+validation_after,100,,,100,100,100,15.73896598815918,277.703
